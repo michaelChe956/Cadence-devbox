@@ -1,7 +1,7 @@
 # cadence devbox Windows 首次安装脚本（podman 路线，对齐 devbox/README.md §2.1–2.4；设计 4.6：≤5 步）
 # 自动完成：1.检测 podman/machine → 2.建安装目录+拷文件+生成密钥模板 → 3.配置国内镜像加速
 #           → 4.建 16 数据卷+拉镜像(直连失败自动走 ghcr 代理)+起中间件与 devbox → 5.打印后续提示
-# 用法（发布包解压后，devbox\ 目录旁打开 PowerShell）：
+# 用法（在仓库根目录——devbox 文件夹的上一层——打开 PowerShell；任意目录则 -File 用绝对路径）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 param(
   [string]$InstallDir = "",

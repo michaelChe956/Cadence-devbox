@@ -74,6 +74,8 @@ uv tool install podman-compose          # 三平台统一装 compose（uv 支持
 
 ### 2.1.1 国内镜像加速（可选，直连慢/超时才配）
 
+> 用 §2.2 一键脚本的用户**跳过本节**——脚本第 3 步已自动写入等效配置（与下文 CLI 同名同内容，配过则自动跳过）。本节供手工安装/脚本加速步失败时补救。
+
 中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速：
 
 **Windows / macOS**（写入 podman machine，二选一）：
@@ -97,11 +99,14 @@ exit
 
 ### 2.2 首次安装：一键脚本 install.ps1（推荐）
 
-Windows 装完 §2.1 的 Podman Desktop 后，**优先直接跑一键安装器**——自动完成本节与 §2.3/§2.4 的全部内容。在 `devbox\` 目录旁打开 PowerShell 执行：
+Windows 装完 §2.1 的 Podman Desktop 后，**优先直接跑一键安装器**——自动完成本节与 §2.3/§2.4 的全部内容。在**仓库根目录**（`devbox` 文件夹的上一层，即 clone 或解压 ZIP 得到的目录，如 `C:\Users\你\Downloads\Cadence-devbox-main`）打开 PowerShell：
 
 ```powershell
+cd C:\Users\你\Downloads\Cadence-devbox-main       # 进入仓库根（devbox 的上一层；.\devbox\ 相对路径依赖它）
 powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 ```
+
+懒 cd 的话任意目录用绝对路径也行：`-File C:\Users\你\Downloads\Cadence-devbox-main\devbox\install.ps1`
 
 参数：`-Workspace`（代码父目录，不传则交互询问）、`-InstallDir`（默认 devbox 旁 `cadence\`）、`-Image`（默认 GHCR latest）。
 
