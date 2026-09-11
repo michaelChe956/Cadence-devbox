@@ -90,23 +90,23 @@ if (Test-Path "$InstallDir\stack\.env") {
 Info "请编辑 $InstallDir\cadence-box.yaml 填写 provider 端点/key/模型（git.name/email 也要填）"
 $done = Read-Host '填完后按回车继续（Ctrl+C 退出先去填）'
 
-# ---- 第 3 步：machine 内写 registry mirror（README §2.2.1，失败不阻断） ----
-Info '第 3/5 步：配置镜像加速（podman machine）'
-if (Probe "podman machine ssh 'test -f /etc/containers/registries.conf.d/999-mirror.conf'") {
-  Info 'mirror 已配置，跳过'
-} else {
-  podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d; printf "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.m.daocloud.io\"\n" > /etc/containers/registries.conf.d/999-mirror.conf'
-  if ($LASTEXITCODE -ne 0) {
-    Warn 'mirror 写入失败，不阻断主流程——拉取慢时可按 README §2.2.1 手工配置'
-  } else { Info '已写入 daocloud mirror（machine 内 registries.conf.d）' }
-}
+# ---- 第 3 步：宿主侧写 registry mirror（README §2.2.1） ----
+# podman remote 机制：Windows 客户端读本机 %APPDATA%\containers 配置并随 pull 生效——不用 machine ssh。
+# 无条件重写（内容固定幂等，兼自愈旧坏文件）；同时清理旧版脚本误写进 machine 的尝试（若有）。
+Info '第 3/5 步：配置镜像加速（daocloud mirror → 宿主 registries.conf.d）'
+$confDir = Join-Path $env:APPDATA 'containers\registries.conf.d'
+New-Item -ItemType Directory -Force -Path $confDir | Out-Null
+$confFile = Join-Path $confDir '999-mirror.conf'
+@('[[registry]]', 'prefix = "docker.io"', 'location = "docker.m.daocloud.io"', '') | Set-Content -Path $confFile -Encoding ascii
+Info "已写入 $confFile"
+Probe "podman machine ssh 'sudo rm -f /etc/containers/registries.conf.d/999-mirror.conf'" | Out-Null
 
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
 Info '第 4/5 步：创建数据卷并启动'
 $vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-agents','cadence-omp',
           'cadence-m2','cadence-npm','cadence-npm-global','cadence-uv','cadence-pip','cadence-gradle',
           'cadence-mysql-data','cadence-redis-data','cadence-rabbitmq-data','cadence-minio-data')
-foreach ($v in $vols) { podman volume create $v | Out-Null }
+foreach ($v in $vols) { if (-not (Probe "podman volume exists $v")) { podman volume create $v | Out-Null } }
 if (-not (Probe "podman image inspect $Image")) {
   Info "拉取镜像 $Image（压缩 872MB，视网速 2–15 分钟）…"
   podman pull $Image

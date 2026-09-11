@@ -176,24 +176,28 @@ podman volume ls | wc -l   # 应输出 16
 
 ### 2.2.1 国内镜像加速（手工安装直连慢/超时才配；一键脚本第 3 步已自动完成）
 
-中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速。跑 §2.2 一键脚本的用户无需动手——脚本写入与本节 CLI 同名同内容（`999-mirror.conf`，已配自动跳过），仅当脚本加速步失败时按本节补救：
+中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速。跑 §2.2 一键脚本的用户无需动手——脚本第 3 步自动写入下述同名文件（幂等），仅当脚本加速步失败时按本节补救：
 
-**Windows / macOS**（写入 podman machine，二选一）：
+**Windows / macOS**（podman remote 客户端读**本机**配置并随 pull 生效，不进 machine；二选一）：
 
 - GUI（推荐）：Podman Desktop → Settings → **Registries** → Add registry，填 `docker.m.daocloud.io`
-- CLI（对 docker.io 全量生效）：
+- 手写 mirror 文件（对 docker.io 全量生效）。Windows（PowerShell）：
 
-```bash
-podman machine ssh
-sudo tee /etc/containers/registries.conf.d/999-mirror.conf > /dev/null <<'EOF'
-[[registry]]
-prefix = "docker.io"
-location = "docker.m.daocloud.io"
-EOF
-exit
+```powershell
+$d = "$env:APPDATA\containers\registries.conf.d"; mkdir $d -Force | Out-Null
+@('[[registry]]','prefix = "docker.io"','location = "docker.m.daocloud.io"','') | Set-Content "$d\999-mirror.conf"
 ```
 
-**Linux**：同 CLI 写法，路径换 `~/.config/containers/registries.conf.d/999-mirror.conf`（目录不存在先 `mkdir -p`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
+  macOS（bash）：
+
+```bash
+mkdir -p ~/.config/containers/registries.conf.d
+printf '[[registry]]\nprefix = "docker.io"\nlocation = "docker.m.daocloud.io"\n' > ~/.config/containers/registries.conf.d/999-mirror.conf
+```
+
+**Linux**：同 macOS 写法（`~/.config/containers/registries.conf.d/`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
+
+> ⚠️ 别用 `podman machine ssh` 往 machine 的 `/etc/containers/` 写——remote 场景 pull 读的是客户端本机配置，写 machine 里不生效。
 
 > devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的 ghcr 代理前缀（ghfast.top 等）或路线 C 离线包。
 
