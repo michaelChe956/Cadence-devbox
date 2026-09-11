@@ -1,0 +1,29 @@
+name: devbox CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: pytest（46 项）与 ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv 与 ShellCheck
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes shellcheck
+
+      - name: pytest（渲染器 / stack CLI / compose 结构 / entrypoint）
+        run: uv run --with pytest --with pyyaml python -m pytest tests/devbox/ -v
+
+      - name: ShellCheck（devbox 脚本）
+        run: shellcheck --shell=bash --severity=warning devbox/entrypoint.sh devbox/stack/stack.sh devbox/stack/stack-lib.sh
