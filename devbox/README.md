@@ -10,24 +10,28 @@ devbox 是给**业务开发/测试人员**的一体化 AI 开发环境容器：�
 
 ## 1. 镜像获取（三选一）
 
-**路线 A：GHCR 公开仓库（推荐，已可用）**
+**路线 A：国内 ACR 阿里云（推荐——免代理免登录直拉，公开仓库）**
+
+```bash
+podman pull crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest
+```
+
+tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。
+
+**路线 B：GHCR 公开仓库（海外/有代理时备选）**
 
 ```bash
 podman pull ghcr.io/michaelche956/cadence-devbox:latest
 ```
 
-直连慢/超时改用南大 ghcr 镜像拉取，再 retag 成正式名（install.ps1 已内置此回退）：
+直连慢/超时改用南大 ghcr 镜像拉取，再 retag 成正式名（install.ps1 对 ghcr 源已内置此回退）：
 
 ```bash
 podman pull ghcr.nju.edu.cn/michaelche956/cadence-devbox:latest
 podman tag ghcr.nju.edu.cn/michaelche956/cadence-devbox:latest ghcr.io/michaelche956/cadence-devbox:latest
 ```
 
-> 各通道实测（2026-09-11，以 podman 实拉为准）：ghcr.io 直连匿名可拉；**ghcr.nju.edu.cn（南大）覆盖本包**；daocloud 只接 docker.io 上游（中间件 mirror 用，见 §2.2.1）；ghfast.top / gh-proxy.com / mirror.ghproxy.com 是 **git 加速代理**（§2.2 路 A 专用），不能拉镜像。
-
-tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。已验证匿名可拉；国内直连慢用南大镜像或路线 C。
-
-**路线 B：国内 ACR（待开通，开通后此处回填地址）**
+> 各通道实测（2026-09-11，以 podman 实拉为准）：阿里云 ACR / ghcr.io 直连 / 南大 ghcr（ghcr.nju.edu.cn）均可拉；daocloud 只接 docker.io 上游（中间件 mirror 用，见 §2.2.1）；ghfast.top / gh-proxy.com / mirror.ghproxy.com 是 **git 加速代理**（§2.2 路 A 专用），不能拉镜像。
 
 **路线 C：离线 tar**
 
@@ -85,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 
 懒 cd 的话任意目录用绝对路径也行：`-File C:\Users\你\Downloads\Cadence-devbox-main\devbox\install.ps1`
 
-参数：`-Workspace`（代码父目录，不传则交互询问）、`-InstallDir`（默认 devbox 旁 `cadence\`）、`-Image`（默认 GHCR latest）。
+参数：`-Workspace`（代码父目录，不传则交互询问）、`-InstallDir`（默认 devbox 旁 `cadence\`）、`-Image`（默认 ACR 地址，见 §1 路线 A）。
 
 脚本自动做的 5 步：
 
@@ -94,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
 | 3 | 配置国内镜像加速：daocloud mirror 写入宿主 `%APPDATA%\containers\registries.conf.d`（podman remote 客户端读取，中间件镜像走 docker.io） | §2.2.1 |
-| 4 | 建 16 个数据卷；拉主镜像（**南大 ghcr 镜像优先**并 retag 成正式名，失败退直连）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
+| 4 | 建 16 个数据卷；拉主镜像（默认**阿里云 ACR**；若 `-Image` 是 ghcr 源则南大优先、失败退直连并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
 **重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；16 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。
@@ -150,13 +154,13 @@ Copy-Item "$repo\cadence-box.yaml.example"         C:\cadence\cadence-box.yaml
 ```powershell
 @"
 CADENCE_WORKSPACE=D:\code
-CADENCE_DEVBOX_IMAGE=ghcr.io/michaelche956/cadence-devbox:latest
+CADENCE_DEVBOX_IMAGE=crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest
 COMPOSE_PROFILES=
 "@ | Set-Content -Encoding utf8 C:\cadence\stack\.env
 ```
 
 - `CADENCE_WORKSPACE`：你的代码父目录（几十个 git 仓库的上一级），将整体挂载为容器内 `/workspace`
-- `CADENCE_DEVBOX_IMAGE`：默认填 GHCR 地址；离线路线改 `localhost/cadence-devbox:dev`
+- `CADENCE_DEVBOX_IMAGE`：默认填阿里云 ACR 地址（§1 路线 A，国内推荐）；备选 GHCR；离线路线改 `localhost/cadence-devbox:dev`
 
 **第 4 步：创建数据卷（external 卷需预建，一次性）**
 
@@ -201,9 +205,8 @@ printf '[[registry]]\nprefix = "docker.io"\nlocation = "docker.m.daocloud.io"\n'
 
 **Linux**：同 macOS 写法（`~/.config/containers/registries.conf.d/`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
 
-> ⚠️ 别用 `podman machine ssh` 往 machine 的 `/etc/containers/` 写——remote 场景 pull 读的是客户端本机配置，写 machine 里不生效。
+> devbox 主镜像：首选 §1 路线 A（阿里云 ACR，免代理直拉）；走 GHCR 时注意上面的 daocloud mirror 只管 docker.io——拉不动用南大镜像（ghcr.nju.edu.cn）或路线 C 离线包。
 
-> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的南大镜像（ghcr.nju.edu.cn）或路线 C 离线包。
 
 ### 2.3 填鉴权文件（唯一要你编辑的文件）
 
@@ -413,7 +416,7 @@ PR 要求：本地 `uv run --with pytest --with pyyaml python -m pytest tests/de
 ```bash
 cd <安装目录>/stack
 # 改 .env 中 CADENCE_DEVBOX_IMAGE 为新周版 tag（如 :2026.38），然后：
-podman pull ghcr.io/michaelche956/cadence-devbox:2026.38
+podman pull crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:2026.38
 podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚本）
 # 离线路线：podman load -i 新包，改 .env 指向新 tag，重建 devbox
 ```

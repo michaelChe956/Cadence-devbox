@@ -1,12 +1,11 @@
 ﻿# cadence devbox Windows 首次安装脚本（podman 路线，对齐 devbox/README.md §2.1–2.4；设计 4.6：≤5 步）
 # 自动完成：1.检测 podman/machine → 2.建安装目录+拷文件+生成密钥模板 → 3.配置国内镜像加速
-#           → 4.建 16 数据卷+拉镜像(直连失败自动走 ghcr 代理)+起中间件与 devbox → 5.打印后续提示
+#           → 4.建 16 数据卷+拉镜像(默认阿里云 ACR 直拉)+起中间件与 devbox → 5.打印后续提示
 # 用法（在仓库根目录——devbox 文件夹的上一层——打开 PowerShell；任意目录则 -File 用绝对路径）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 param(
-  [string]$InstallDir = "",
+  [string]$Image = "crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest"
   [string]$Workspace = "",
-  [string]$Image = "ghcr.io/michaelche956/cadence-devbox:latest"
 )
 $ErrorActionPreference = 'Stop'
 if (-not $InstallDir) { $InstallDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'cadence' }
@@ -108,8 +107,8 @@ $vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-
           'cadence-mysql-data','cadence-redis-data','cadence-rabbitmq-data','cadence-minio-data')
 foreach ($v in $vols) { if (-not (Probe "podman volume exists $v")) { podman volume create $v | Out-Null } }
 if (-not (Probe "podman image inspect $Image")) {
-  # 拉取顺序（2026-09-11 podman 实测）：南大 ghcr 镜像优先（国内快、覆盖本包），失败退直连，再失败走路线 C。
-  # 南大拉到后 retag 成 -Image 正式名，compose/.env 引用不受影响。
+  # 拉取顺序（2026-09-11 podman 实测）：默认走阿里云 ACR（免代理免登录直拉）。
+  # 若 -Image 是 ghcr.io 源：南大 ghcr 镜像优先（国内快、覆盖本包），失败退直连；拉到后 retag 成 -Image 正式名。
   # 注：daocloud 只接 docker.io 上游（中间件 mirror 专用，见第 3 步）；ghfast/gh-proxy 等 gh 代理仅适用于 git clone。
   $px = $Image -replace '^ghcr\.io/', 'ghcr.nju.edu.cn/'
   $tries = @($px)
@@ -123,8 +122,7 @@ if (-not (Probe "podman image inspect $Image")) {
   if ($src) {
     if ($src -ne $Image) { podman tag $src $Image; podman rmi $src | Out-Null }
   } else {
-    Warn "南大与直连均失败：走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
-    Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
+    Warn "拉取失败：可走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑；或 -Image ghcr.io/michaelche956/cadence-devbox:latest 切 GHCR（自动南大回退）"
   }
 }
 podman-compose -f "$InstallDir\stack\compose.yaml" up -d mysql redis
