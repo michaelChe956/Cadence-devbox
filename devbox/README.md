@@ -4,6 +4,10 @@
 > 完整设计见 `cadence/designs/2026-09-11_方案设计_Cadence-skills一体化开发环境容器devbox_v1.0.md`
 > 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测，Windows/macOS 路线待 §8 真机验收。
 
+## 0. 这是什么、为什么（背景与目的）
+
+devbox 是给**业务开发/测试人员**的一体化 AI 开发环境容器：预装 claude/codex/pi/kimi/omp 五端 CLI 与 Java/前端/Python 工具链，编排 mysql/redis/rabbitmq/minio，鉴权只需维护一份 `cadence-box.yaml`。你装一次 Podman Desktop，剩下的一切——构建、运行、中间件、AI agent——都在容器里；代码始终留在宿主你自己的磁盘上（双向共享）。背景与完整动机见[仓库 README](../README.md#背景与目的)。
+
 ## 1. 镜像获取（三选一）
 
 **路线 A：GHCR 公开仓库（推荐，已可用）**
