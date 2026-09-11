@@ -2,7 +2,7 @@
 
 > 版本：第一期（2026-09-11）｜ 运行时：**podman**（Windows/macOS/Linux 三平台统一）｜ 镜像压缩体积 872MB ｜ 内置：claude 2.1.247 / codex 0.153.4 / pi 0.85.0 / omp 18.1.17（bun 1.4.2）/ kimi（官方安装器）+ JDK21 + Maven 3.9.16 + Node 24.21.0 + uv 0.12.11 + mysql/redis/rabbitmq/minio 编排
 > 完整设计见 `cadence/designs/2026-09-11_方案设计_Cadence-skills一体化开发环境容器devbox_v1.0.md`
-> 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测，Windows/macOS 路线待 §7 真机验收。
+> 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测，Windows/macOS 路线待 §8 真机验收。
 
 ## 1. 镜像获取（三选一）
 
@@ -163,7 +163,7 @@ Linux 下 devbox 启动命令在 §2.4 基础上**必须加 `--userns=keep-id`**
 | 平台 | 状态 | 差异 |
 |---|---|---|
 | Linux rootless podman | ✅ 已实测（一期验收+E2E） | `--userns=keep-id` 必需；cgroupfs 配置；rabbitmq 命名卷权限问题（mysql/redis/minio 正常） |
-| Windows Podman Desktop | ⏳ 待 §7 真机验证 | machine 默认 rootful，理论免 keep-id/cgroup 配置；宿主路径自动映射进 machine |
+| Windows Podman Desktop | ⏳ 待 §8 真机验证 | machine 默认 rootful，理论免 keep-id/cgroup 配置；宿主路径自动映射进 machine |
 | macOS podman machine | ⏳ 待真机验证 | 同上（Apple 虚拟化） |
 
 stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适配 podman 双形态。
@@ -182,7 +182,9 @@ stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适�
 
 代码工作方式：宿主 IDE 照常编辑 `D:\code`（或 `~/code`）下的仓库，容器内 agent/构建实时看到同一工作树（bind 双向共享）；push 在宿主 git 客户端完成。
 
-## 4. 中间件速查（容器内 `stack` 命令）
+## 4. 中间件管理（容器内 `stack` 命令）
+
+### 4.1 命令速查
 
 ```text
 stack ls                    官方目录 + 当前启用 profile + CHANGES.md 摘要
@@ -196,9 +198,82 @@ stack report                环境报告（服务+版本+变更摘要）
 app run/stop/logs/port      本地应用生命周期
 ```
 
-默认目录：mysql:8.4、redis:7.4（默认启用）；rabbitmq:3.13-management（profile `mq`）；minio（profile `storage`）。
+官方目录（已验证、tag pin、随镜像周更扩充）：mysql:8.4、redis:7.4（默认启用）；rabbitmq:3.13-management（profile `mq`）；minio（profile `storage`）。
 
-## 5. 如何更新
+### 4.2 用户想增加中间件怎么办（两条路，推荐 A）
+
+**路 A：官方目录里有的——一行启用**
+
+目录内组件已做版本 pin、健康检查、连接串模板和国内源验证，直接启用：
+
+```bash
+stack enable mq          # 启用 rabbitmq（写 COMPOSE_PROFILES 并拉起）
+stack status             # 等到 (healthy)
+stack conn rabbitmq      # 拿标准连接串：amqp://...:5672 + 管理台 http://127.0.0.1:15672
+```
+
+或者更简单——**对容器内 agent 说一句「把 rabbitmq 打开」**，它会按 devbox-stack skill 协议执行上面全套并回报结果。
+
+**路 B：目录里没有的（kafka / elasticsearch / nacos…）——agent 自加 + 留痕**
+
+对 agent 说「**加个 kafka**」即可。skill 协议会驱动 agent 完成：
+
+1. `stack ls` 查官方目录——确认没有，走自加
+2. `stack add kafka --tpl rabbitmq`——用最相近的官方模板生成 service 片段（要求 tag pin、数据卷、healthcheck），追加进 `/cadence/stack/compose.yaml`
+3. 自动在 `/cadence/stack/CHANGES.md` 追加留痕行（`- 2026-09-11 add kafka`）——这是模板同步识别用户改动的依据
+4. `stack enable`/`up -d` 拉起，`stack conn kafka` 给连接串
+5. 提醒你：「这是临时配置，建议反馈维护者固化」
+
+手动执行也是同样两条命令（`stack add` + 拉起），但**别绕过 stack 直接编辑 compose**——不经 skill 的改动不进 CHANGES.md，周更模板同步时会被当作冲突处理。
+
+**反馈闭环（让常用组件转正）**：把 `stack report` 输出发给维护者；被多个用户采用的自加项会进入官方目录，下个周版镜像默认可用（一行 enable 即达）。
+
+### 4.3 换版本 / 删组件
+
+- 换版本：目录内组件改 `/cadence/stack/compose.yaml` 中该 service 的 image tag 后 `stack restart <名>`（agent 可代劳）
+- 删组件：`stack rm <名>`；连数据一起删用 `--purge`（会二次确认）
+
+## 5. 实测案例：Java Spring Web + Vue + MySQL + Redis 全链路（2026-09-11 本机实测）
+
+> 环境：Arch Linux + podman 6.1.1。以下数字全部来自真实运行，非设计目标。
+
+### 5.1 拓扑
+
+```text
+宿主浏览器 ──:3000──▶ vite dev server ──proxy /api──▶ Spring Boot :8080 ──▶ mysql:3306 / redis:6379
+                    （devbox 容器）                  （devbox 容器）      （compose 兄弟容器，服务名直连）
+```
+
+代码放在宿主 `~/cadence/ws`（bind 共享），构建/运行全在容器内。
+
+### 5.2 操作流程（6 步，约 8 分钟首跑）
+
+1. **按 §2 起环境**：`stack` 目录下 `podman-compose up -d mysql redis` + `podman run` 起 devbox
+2. **写代码**（两种任选）：宿主 IDE 手写，或进容器对 agent 说——
+   > 「创建一个最小 Spring Boot 3 应用：`/api/items` 增查走 MySQL（表自动建），`/api/hits` 走 Redis 计数，跑在 8080；再创建 vue3+vite 前端，代理 `/api` 到 8080，dev server 跑 3000 并对宿主可访问」
+3. **起后端**：容器内 `app run backend -- mvn spring-boot:run`——首次从 aliyun 拉依赖约 2–4 分钟，**二次启动 1.05 秒**
+4. **起前端**：容器内 `npm create vite@latest web -- --template vue`（实测 0.7s）→ 配 proxy → `npm install`（npmmirror，实测 60s 含启动 dev server）
+5. **访问**：宿主浏览器开 `http://localhost:3000`
+6. **核对数据**：Navicat 连 `127.0.0.1:3306`（root/cadence123）；容器内 `stack logs mysql` / `docker exec … redis-cli GET hits`
+
+### 5.3 实测效果
+
+| 验证点 | 实测结果 |
+|---|---|
+| Web API 写 MySQL | `POST /api/items` → `{"ok":true,"name":"第一条-E2E写入"}`；库内 `select` 与 API 返回一致，**中文无损** |
+| Web API 读 MySQL | `GET /api/items` 返回 JSON 列表（id/name/created_at），经 vite 代理与直连 8080 结果一致 |
+| Redis 计数 | curl 路径 2→3；**浏览器页面路径累计到 12**（redis-cli 直查同步） |
+| 页面 | 浏览器渲染「devbox E2E — SpringBoot + MySQL + Redis + Vue」：输入框写库、列表实时刷新、计数按钮即时累加（截图留证） |
+| 服务名连通 | 容器内 `mysql`/`redis` DNS 解析 + TCP 直连 OK |
+| 双向工作树 | 宿主写代码→容器构建运行；容器产物宿主可见 |
+
+顺带战果：该 E2E 抓出官方连接串模板 2 个必挂 bug（`characterEncoding=utf8mb4`、缺 `allowPublicKeyRetrieval`），已修复并烧进镜像。
+
+### 5.4 参考计时（验收 3 探针，依赖预热后）
+
+`mvn archetype:generate` 15s ｜ spring-boot-starter-web 依赖拉取 20s ｜ `npm create vite` 0.7s ｜ `uv init` 0.1s
+
+## 6. 如何更新
 
 **镜像更新（周更）**
 
@@ -214,16 +289,16 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 
 **数据与回滚**：16 个数据卷独立于镜像，更新镜像不动数据；回滚=把 `.env` 的镜像 tag 改回上一周版重建 devbox。缓存膨胀时 `podman system prune`（不会碰 external 卷）。
 
-## 6. FAQ
+## 7. FAQ
 
 1. **企业敏感场景关闭运维通道**：devbox 启动命令去掉 `-v /var/run/podman/podman.sock:/var/run/docker.sock`（或参考 `stack/docker-compose.no-sock.yml`）——agent 仍能连中间件端口开发，但不能启停容器
 2. **新仓库避免换行符幻影 diff**：仓库根加 `.gitattributes`：`* text=auto eol=lf`
 3. **宿主与容器同时跑 git 偶发 index.lock**：瞬时锁，重试即可；agent 提交时避免宿主同时操作
 4. **dev server 收不到宿主侧文件改动**：镜像已默认 `CHOKIDAR_USEPOLLING=1`（vite）；spring-boot-devtools 需在配置中开启轮询：`spring.devtools.restart.poll-interval=1s` + `quiet-period=0.8s`
 
-## 7. Windows 真机验收（待执行——第一期交付后由维护者在真机完成）
+## 8. Windows 真机验收（待执行——第一期交付后由维护者在真机完成）
 
-### 7.1 执行指引
+### 8.1 执行指引
 
 **阶段 A（Arch 维护机）**：
 
@@ -245,7 +320,7 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 
 **阶段 D**：截图/录屏按 7.2 清单归档；macOS 真机同法（§2.1 macOS 路线）。
 
-### 7.2 验收清单（设计文档「七、验证口径」）
+### 8.2 验收清单（设计文档「七、验证口径」）
 
 - [ ] 1.【真机人工】装机到进终端（留证：机型、Podman/镜像版本、网络环境、命令、录屏）——**Linux 侧已预覆盖安装布局逻辑**
 - [ ] 2. 改 `cadence-box.yaml` 换 key/模型 → 重启容器 → 五端按新配置工作；容器销毁重建配置仍生效——**已预覆盖**（渲染 6 文件 + exit 2 拒启，46 项测试；真机补真实 key 验证）
@@ -254,7 +329,7 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 - [ ] 5. skills 首启投影 + 体积 ≤1GB——**已达标**（872MB；devbox-stack skill 待仓库 merge 后随 install.sh 投影）
 - [ ] 6.【真机】中间件全链路（含 minio 上传）——**Linux 容器侧已预覆盖**（Spring+Vue+MySQL+Redis 全链路实测，2 个连接串模板 bug 已修复）
 
-## 8. 镜像构建信息
+## 9. 镜像构建信息
 
 - 构建上下文：`devbox/`；版本 pin 唯一来源 `devbox/versions.env`（升级只改它 + Dockerfile 默认值）
 - 版本清单：容器内 `cat /opt/cadence/versions.txt`
