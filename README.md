@@ -27,6 +27,10 @@ podman pull ghcr.io/michaelche956/cadence-devbox:latest
 
 push/PR 触发 pytest + ShellCheck；镜像自动构建与签名在二期接入。
 
+## 贡献：新增官方目录组件
+
+用户侧三条路（本地自用 / 提 Issue / 提 PR）见 [devbox/README.md §4.2](devbox/README.md#42-用户想增加中间件怎么办两条路推荐-a)。贡献 catalog 条目的四件套清单与 PR 要求同节。
+
 ## 与 Cadence-skills 的关系
 
 - skills 源与本产物的 skill（`devbox-stack`）在 Cadence-skills 仓库，经 install.sh 投影进容器

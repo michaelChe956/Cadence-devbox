@@ -226,7 +226,22 @@ stack conn rabbitmq      # 拿标准连接串：amqp://...:5672 + 管理台 http
 
 手动执行也是同样两条命令（`stack add` + 拉起），但**别绕过 stack 直接编辑 compose**——不经 skill 的改动不进 CHANGES.md，周更模板同步时会被当作冲突处理。
 
-**反馈闭环（让常用组件转正）**：把 `stack report` 输出发给维护者；被多个用户采用的自加项会进入官方目录，下个周版镜像默认可用（一行 enable 即达）。
+**想让组件转正进官方目录？三条路（按你意愿选）**：
+
+1. **只自己用**：什么都不用做——路 B 的 `stack add` 结果在你的 `/cadence/stack` 里永久有效（宿主文件+数据卷，重启/重建容器都在），只是不随镜像分发
+2. **提 Issue 点菜**：到 [Cadence-devbox Issues](https://github.com/michaelChe956/Cadence-devbox/issues) 提「希望官方目录支持 <组件名>」，附上你的 `stack report` / CHANGES.md 内容更佳——作者据此排期加入，下个周版镜像生效
+3. **自己提 PR（或直接找作者加）**：按下方「贡献新组件」清单提交 [Pull Request](https://github.com/michaelChe956/Cadence-devbox/compare)，合并即转正
+
+**贡献新组件的清单**（`devbox/stack/catalog/<组件名>/` 四件套，参照现有 rabbitmq 条目）：
+
+| 文件 | 要求 |
+|---|---|
+| `profile` | 一行：所属 profile 名（非默认组件用独立 profile，如 `mq`/`storage`/`kafka`） |
+| `service.fragment.yaml` | compose 片段：**image tag 精确 pin**（禁 latest）、`127.0.0.1` 端口绑定、数据卷、healthcheck |
+| `conn.txt` | 标准连接串 + `application.yaml` 片段（JDBC/URI 格式实测可用，勿踩 `utf8mb4`/`allowPublicKeyRetrieval` 类坑） |
+| `conf/`（可选） | 默认配置骨架（如 my.cnf/redis.conf） |
+
+PR 要求：本地 `uv run --with pytest --with pyyaml python -m pytest tests/devbox/ -v` 全绿；若组件进默认启用集，需同步更新 `tests/devbox/test_compose_structure.py` 的服务断言。CI 会自动跑。
 
 ### 4.3 换版本 / 删组件
 
