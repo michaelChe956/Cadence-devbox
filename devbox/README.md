@@ -42,7 +42,7 @@ podman version                           # 验证
 ```
 
 - 安装器后台自动启用所需 Windows 虚拟化组件，按提示重启一次；提示 BIOS 虚拟化未开时进 BIOS 打开
-- 国内加速（拉中间件镜像用）：Podman Desktop → Settings → **Registries**，添加 `docker.m.daocloud.io`
+- 国内加速（直连 docker.io 慢/超时才需要）：见 §2.1.1
 
 **macOS**：
 
@@ -59,20 +59,70 @@ sudo pacman -S podman                   # Arch；Debian/Ubuntu 用 apt install p
 uv tool install podman-compose          # 三平台统一装 compose（uv 支持 Windows/macOS/Linux）
 ```
 
-### 2.2 建安装目录（一次性）
+### 2.1.1 国内镜像加速（可选，直连慢/超时才配）
 
-以下以 Windows `C:\cadence` 为例（macOS/Linux 用 `~/cadence`，命令同理）：
+中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速：
 
-```powershell
-mkdir C:\cadence; cd C:\cadence
-# 从仓库 devbox/ 目录拷入：compose.yaml、stack\（含 catalog、docker-compose.no-sock.yml）、cadence-box.yaml.example
-Rename-Item cadence-box.yaml.example cadence-box.yaml
-mkdir stack -Force
-Move-Item compose.yaml stack\
-# stack\ 目录应含：compose.yaml、catalog\、docker-compose.no-sock.yml
+**Windows / macOS**（写入 podman machine，二选一）：
+
+- GUI（推荐）：Podman Desktop → Settings → **Registries** → Add registry，填 `docker.m.daocloud.io`
+- CLI（对 docker.io 全量生效）：
+
+```bash
+podman machine ssh
+sudo tee /etc/containers/registries.conf.d/999-mirror.conf > /dev/null <<'EOF'
+[[registry]]
+prefix = "docker.io"
+location = "docker.m.daocloud.io"
+EOF
+exit
 ```
 
-写 `stack\.env`（三行）：
+**Linux**：同 CLI 写法，路径换 `~/.config/containers/registries.conf.d/999-mirror.conf`（目录不存在先 `mkdir -p`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
+
+> devbox 主镜像在 ghcr.io：公共加速镜像不覆盖 GHCR 个人包，路线 A 拉不动时走 §1 路线 C 离线包，不要给 ghcr.io 套用上面的 mirror。
+
+### 2.2 建安装目录（一次性）
+
+
+> Windows 懒人路线：跳过本节与 §2.4 手工步骤，直接在 `devbox\` 旁运行一键安装器 `install.ps1`（自动完成建目录/拷文件/加速/建卷/启动全程）：`powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code`
+
+最终布局（以 Windows `C:\cadence` 为例；macOS/Linux 用 `~/cadence`，命令同理）：
+
+```text
+C:\cadence\
+├── cadence-box.yaml                ← devbox\cadence-box.yaml.example 拷入后改名（§2.3 填密钥）
+└── stack\
+    ├── compose.yaml                ← devbox\compose.yaml
+    ├── docker-compose.no-sock.yml  ← devbox\stack\docker-compose.no-sock.yml
+    └── catalog\                    ← devbox\stack\catalog\（整个目录）
+```
+
+**第 1 步：拿到仓库文件（二选一）**
+
+- 路 A（本机有 git）：`git clone https://github.com/michaelChe956/Cadence-devbox.git`，记下其中 `devbox` 目录的完整路径
+- 路 B（纯浏览器）：仓库页 → 绿色 **Code** 按钮 → **Download ZIP** → 解压到任意位置（示例 `C:\Users\你\Downloads\`，得到 `Cadence-devbox-main\`）
+
+**第 2 步：打开 PowerShell，复制 4 项文件**
+
+任务栏搜索框输入 `powershell` → 回车打开（必须是 PowerShell，不是 CMD，语法不通用）。逐条粘贴执行，`$repo` 那行先改成第 1 步的实际路径：
+
+```powershell
+mkdir C:\cadence\stack -Force
+$repo = "C:\Users\你\Downloads\Cadence-devbox-main\devbox"
+Copy-Item "$repo\compose.yaml"                     C:\cadence\stack\compose.yaml
+Copy-Item "$repo\stack\docker-compose.no-sock.yml" C:\cadence\stack\docker-compose.no-sock.yml
+Copy-Item "$repo\stack\catalog"                    C:\cadence\stack\catalog -Recurse
+Copy-Item "$repo\cadence-box.yaml.example"         C:\cadence\cadence-box.yaml
+```
+
+不想敲命令？资源管理器等价操作：
+
+1. `Win+E` 打开资源管理器 → C 盘新建文件夹 `cadence`，进去再新建 `stack`
+2. 进入解压出的 `devbox` 文件夹，按上方布局把 4 项分别复制到对应位置（`catalog` 整个文件夹拖进 `stack`）
+3. `cadence-box.yaml.example` 粘贴到 `C:\cadence` 后重命名为 `cadence-box.yaml`——先勾上「查看 → 文件扩展名」，否则 `.example` 后缀去不干净
+
+**第 3 步：写 `stack\.env`（三行）**
 
 ```powershell
 @"
@@ -85,10 +135,22 @@ COMPOSE_PROFILES=
 - `CADENCE_WORKSPACE`：你的代码父目录（几十个 git 仓库的上一级），将整体挂载为容器内 `/workspace`
 - `CADENCE_DEVBOX_IMAGE`：默认填 GHCR 地址；离线路线改 `localhost/cadence-devbox:dev`
 
-创建数据卷（external 卷需预建）：
+**第 4 步：创建数据卷（external 卷需预建，一次性）**
+
+compose.yaml 里 16 个卷全部声明 `external: true`——podman-compose 只挂载、不创建，卷不存在则启动直接报错；预建后数据与容器生命周期解耦（`down -v`、`system prune` 都删不掉，重建容器/升级镜像数据全在）。三步：
 
 ```powershell
+podman machine start     # ① 确保 machine 在跑（已启动会提示 already running，继续即可）
+# ② 整行复制粘贴——16 个卷逐个创建约 1 秒；重复执行无害（已存在的报错跳过）
 "cadence-claude","cadence-codex","cadence-pi","cadence-kimi","cadence-agents","cadence-omp","cadence-m2","cadence-npm","cadence-npm-global","cadence-uv","cadence-pip","cadence-gradle","cadence-mysql-data","cadence-redis-data","cadence-rabbitmq-data","cadence-minio-data" | ForEach-Object { podman volume create $_ }
+podman volume ls         # ③ 验证：列出 16 行 cadence- 开头的卷
+```
+
+macOS/Linux 等价命令（bash 循环）：
+
+```bash
+for v in cadence-claude cadence-codex cadence-pi cadence-kimi cadence-agents cadence-omp cadence-m2 cadence-npm cadence-npm-global cadence-uv cadence-pip cadence-gradle cadence-mysql-data cadence-redis-data cadence-rabbitmq-data cadence-minio-data; do podman volume create "$v"; done
+podman volume ls | wc -l   # 应输出 16
 ```
 
 ### 2.3 填鉴权文件（唯一要你编辑的文件）
