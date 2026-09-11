@@ -45,7 +45,7 @@ if (-not $state) {
   if ($LASTEXITCODE -ne 0) { Die 'podman machine start 失败：请把上方错误反馈维护者' }
 }
 if (-not (Get-Command podman-compose -ErrorAction SilentlyContinue)) {
-  Die "未检测到 podman-compose（README §2.1）：pip install podman-compose 或 uv tool install podman-compose 后重跑本脚本"
+  Die "未检测到 podman-compose。装法（README §2.1）：winget install Python.Python.3.12 后新开 PowerShell，再 pip install podman-compose -i https://pypi.tuna.tsinghua.edu.cn/simple，然后重跑本脚本"
 }
 
 # ---- 第 2 步：生成安装目录 cadence-box.yaml 与 stack（README §2.2/2.3） ----

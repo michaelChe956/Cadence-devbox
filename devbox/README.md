@@ -48,9 +48,13 @@ winget install RedHat.Podman-Desktop     # 或官网下载安装包
 podman machine init                      # 首次初始化（GUI 里点 Initialize 等价）
 podman machine start
 podman version                           # 验证
+winget install Python.Python.3.12        # compose 依赖 Python（已装可跳过）；装完新开一个 PowerShell 再继续
+pip install podman-compose -i https://pypi.tuna.tsinghua.edu.cn/simple   # §2.4/一键脚本都依赖它
+podman-compose --version                 # 验证，输出版本号即通
 ```
 
 - 安装器后台自动启用所需 Windows 虚拟化组件，按提示重启一次；提示 BIOS 虚拟化未开时进 BIOS 打开
+- `pip` 装包走清华源；`winget install` Python 后 PATH 需新开 PowerShell 才生效——`podman-compose` 报「无法识别」九成是这两条没做
 - 国内加速（直连 docker.io 慢/超时才需要）：见 §2.1.1
 
 **macOS**：
