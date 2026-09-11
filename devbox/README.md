@@ -16,7 +16,14 @@ devbox 是给**业务开发/测试人员**的一体化 AI 开发环境容器：�
 podman pull ghcr.io/michaelche956/cadence-devbox:latest
 ```
 
-tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。已验证匿名可拉；公共加速镜像（daocloud/南大）不覆盖 GHCR 个人包，国内若直连慢用路线 C。
+直连慢/超时改用 ghcr 代理前缀拉取，再 retag 成正式名（install.ps1 已内置此回退）：
+
+```bash
+podman pull ghfast.top/ghcr.io/michaelche956/cadence-devbox:latest
+podman tag ghfast.top/ghcr.io/michaelche956/cadence-devbox:latest ghcr.io/michaelche956/cadence-devbox:latest
+```
+
+tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。已验证匿名可拉；公共加速镜像（daocloud/南大）不覆盖 GHCR 个人包——国内直连慢用上面代理前缀或路线 C。
 
 **路线 B：国内 ACR（待开通，开通后此处回填地址）**
 
@@ -29,6 +36,8 @@ podman load -i devbox-image.tar.gz     # 导入为 localhost/cadence-devbox:dev
 ```
 
 ## 2. 初次使用
+
+> 首次安装路线：**Windows 优先一键脚本（§2.2，自动完成 §2.2–§2.4 全程）**；macOS/Linux 或想逐条理解时走手工步骤。
 
 ### 2.1 安装 podman（一次性，按平台）
 
@@ -80,12 +89,32 @@ exit
 
 **Linux**：同 CLI 写法，路径换 `~/.config/containers/registries.conf.d/999-mirror.conf`（目录不存在先 `mkdir -p`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
 
-> devbox 主镜像在 ghcr.io：公共加速镜像不覆盖 GHCR 个人包，路线 A 拉不动时走 §1 路线 C 离线包，不要给 ghcr.io 套用上面的 mirror。
+> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的 ghcr 代理前缀（ghfast.top 等）或路线 C 离线包。
 
-### 2.2 建安装目录（一次性）
+### 2.2 首次安装：一键脚本 install.ps1（推荐）
 
+Windows 装完 §2.1 的 Podman Desktop 后，**优先直接跑一键安装器**——自动完成本节与 §2.3/§2.4 的全部内容。在 `devbox\` 目录旁打开 PowerShell 执行：
 
-> Windows 懒人路线：跳过本节与 §2.4 手工步骤，直接在 `devbox\` 旁运行一键安装器 `install.ps1`（自动完成建目录/拷文件/加速/建卷/启动全程）：`powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code`
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
+```
+
+参数：`-Workspace`（代码父目录，不传则交互询问）、`-InstallDir`（默认 devbox 旁 `cadence\`）、`-Image`（默认 GHCR latest）。
+
+脚本自动做的 5 步：
+
+| 步 | 内容 | 对应手工段落 |
+|---|---|---|
+| 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
+| 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
+| 3 | 配置国内镜像加速：daocloud mirror 写入 podman machine（中间件镜像走 docker.io） | §2.1.1 |
+| 4 | 建 16 个数据卷；拉主镜像（直连失败自动依次试 ghfast.top / gh-proxy.com / mirror.ghproxy.com 三个 ghcr 代理并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
+| 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
+
+**重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；16 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。
+
+以下手工步骤供 macOS/Linux 用户、或想逐条理解/脚本不可用时使用：
+
 
 最终布局（以 Windows `C:\cadence` 为例；macOS/Linux 用 `~/cadence`，命令同理）：
 
@@ -100,8 +129,16 @@ C:\cadence\
 
 **第 1 步：拿到仓库文件（二选一）**
 
-- 路 A（本机有 git）：`git clone https://github.com/michaelChe956/Cadence-devbox.git`，记下其中 `devbox` 目录的完整路径
-- 路 B（纯浏览器）：仓库页 → 绿色 **Code** 按钮 → **Download ZIP** → 解压到任意位置（示例 `C:\Users\你\Downloads\`，得到 `Cadence-devbox-main\`）
+**路 A（本机有 git）**——直连或代理任选其一，克隆后记下其中 `devbox` 目录的完整路径：
+
+```bash
+git clone https://github.com/michaelChe956/Cadence-devbox.git                            # 直连
+git clone https://ghfast.top/https://github.com/michaelChe956/Cadence-devbox.git         # 代理①
+git clone https://gh-proxy.com/https://github.com/michaelChe956/Cadence-devbox.git       # 代理②
+git clone https://mirror.ghproxy.com/https://github.com/michaelChe956/Cadence-devbox.git # 代理③
+```
+
+**路 B（纯浏览器）**：仓库页 → 绿色 **Code** 按钮 → **Download ZIP** → 解压到任意位置（示例 `C:\Users\你\Downloads\`，得到 `Cadence-devbox-main\`）。下载慢时直接浏览器开代理地址：`https://ghfast.top/https://github.com/michaelChe956/Cadence-devbox/archive/refs/heads/main.zip`
 
 **第 2 步：打开 PowerShell，复制 4 项文件**
 

@@ -1,4 +1,6 @@
 # cadence devbox Windows 首次安装脚本（podman 路线，对齐 devbox/README.md §2.1–2.4；设计 4.6：≤5 步）
+# 自动完成：1.检测 podman/machine → 2.建安装目录+拷文件+生成密钥模板 → 3.配置国内镜像加速
+#           → 4.建 16 数据卷+拉镜像(直连失败自动走 ghcr 代理)+起中间件与 devbox → 5.打印后续提示
 # 用法（发布包解压后，devbox\ 目录旁打开 PowerShell）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 param(
@@ -109,8 +111,23 @@ if (-not (Probe "podman image inspect $Image")) {
   Info "拉取镜像 $Image（压缩 872MB，视网速 2–15 分钟）…"
   podman pull $Image
   if ($LASTEXITCODE -ne 0) {
-    Warn "直连拉取失败：公共加速不覆盖 GHCR 个人包，慢/不通可走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
-    Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
+    # 直连失败，依次尝试 ghcr 代理前缀（容器引用语法不带 https://），成功后 retag 为正式名
+    $proxies = @('ghfast.top/', 'gh-proxy.com/', 'mirror.ghproxy.com/')
+    $pulled = $false
+    foreach ($p in $proxies) {
+      $px = "${p}${Image}"
+      Info "直连失败，尝试代理：$px"
+      podman pull $px
+      if ($LASTEXITCODE -ne 0) { continue }
+      podman tag $px $Image
+      podman rmi $px | Out-Null
+      $pulled = $true
+      break
+    }
+    if (-not $pulled) {
+      Warn "直连与代理均失败：可走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
+      Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
+    }
   }
 }
 podman-compose -f "$InstallDir\stack\compose.yaml" up -d mysql redis
