@@ -90,14 +90,14 @@ if (Test-Path "$InstallDir\stack\.env") {
 Info "请编辑 $InstallDir\cadence-box.yaml 填写 provider 端点/key/模型（git.name/email 也要填）"
 $done = Read-Host '填完后按回车继续（Ctrl+C 退出先去填）'
 
-# ---- 第 3 步：machine 内写 registry mirror（README §2.1.1，失败不阻断） ----
+# ---- 第 3 步：machine 内写 registry mirror（README §2.2.1，失败不阻断） ----
 Info '第 3/5 步：配置镜像加速（podman machine）'
 if (Probe "podman machine ssh 'test -f /etc/containers/registries.conf.d/999-mirror.conf'") {
   Info 'mirror 已配置，跳过'
 } else {
   podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d; printf "[[registry]]\nprefix = \"docker.io\"\nlocation = \"docker.m.daocloud.io\"\n" > /etc/containers/registries.conf.d/999-mirror.conf'
   if ($LASTEXITCODE -ne 0) {
-    Warn 'mirror 写入失败，不阻断主流程——拉取慢时可按 README §2.1.1 手工配置'
+    Warn 'mirror 写入失败，不阻断主流程——拉取慢时可按 README §2.2.1 手工配置'
   } else { Info '已写入 daocloud mirror（machine 内 registries.conf.d）' }
 }
 

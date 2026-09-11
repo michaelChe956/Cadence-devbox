@@ -55,7 +55,7 @@ podman-compose --version                 # 验证，输出版本号即通
 
 - 安装器后台自动启用所需 Windows 虚拟化组件，按提示重启一次；提示 BIOS 虚拟化未开时进 BIOS 打开
 - `pip` 装包走清华源；`winget install` Python 后 PATH 需新开 PowerShell 才生效——`podman-compose` 报「无法识别」九成是这两条没做
-- 国内加速（直连 docker.io 慢/超时才需要）：见 §2.1.1
+- 国内加速：一键脚本已内置（§2.2 第 3 步）；手工安装直连慢再配（§2.2.1）
 
 **macOS**：
 
@@ -71,31 +71,6 @@ podman version
 sudo pacman -S podman                   # Arch；Debian/Ubuntu 用 apt install podman
 uv tool install podman-compose          # 三平台统一装 compose（uv 支持 Windows/macOS/Linux）
 ```
-
-### 2.1.1 国内镜像加速（可选，直连慢/超时才配）
-
-> 用 §2.2 一键脚本的用户**跳过本节**——脚本第 3 步已自动写入等效配置（与下文 CLI 同名同内容，配过则自动跳过）。本节供手工安装/脚本加速步失败时补救。
-
-中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速：
-
-**Windows / macOS**（写入 podman machine，二选一）：
-
-- GUI（推荐）：Podman Desktop → Settings → **Registries** → Add registry，填 `docker.m.daocloud.io`
-- CLI（对 docker.io 全量生效）：
-
-```bash
-podman machine ssh
-sudo tee /etc/containers/registries.conf.d/999-mirror.conf > /dev/null <<'EOF'
-[[registry]]
-prefix = "docker.io"
-location = "docker.m.daocloud.io"
-EOF
-exit
-```
-
-**Linux**：同 CLI 写法，路径换 `~/.config/containers/registries.conf.d/999-mirror.conf`（目录不存在先 `mkdir -p`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
-
-> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的 ghcr 代理前缀（ghfast.top 等）或路线 C 离线包。
 
 ### 2.2 首次安装：一键脚本 install.ps1（推荐）
 
@@ -116,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 |---|---|---|
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
-| 3 | 配置国内镜像加速：daocloud mirror 写入 podman machine（中间件镜像走 docker.io） | §2.1.1 |
+| 3 | 配置国内镜像加速：daocloud mirror 写入 podman machine（中间件镜像走 docker.io） | §2.2.1 |
 | 4 | 建 16 个数据卷；拉主镜像（直连失败自动依次试 ghfast.top / gh-proxy.com / mirror.ghproxy.com 三个 ghcr 代理并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
@@ -198,6 +173,29 @@ macOS/Linux 等价命令（bash 循环）：
 for v in cadence-claude cadence-codex cadence-pi cadence-kimi cadence-agents cadence-omp cadence-m2 cadence-npm cadence-npm-global cadence-uv cadence-pip cadence-gradle cadence-mysql-data cadence-redis-data cadence-rabbitmq-data cadence-minio-data; do podman volume create "$v"; done
 podman volume ls | wc -l   # 应输出 16
 ```
+
+### 2.2.1 国内镜像加速（手工安装直连慢/超时才配；一键脚本第 3 步已自动完成）
+
+中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速。跑 §2.2 一键脚本的用户无需动手——脚本写入与本节 CLI 同名同内容（`999-mirror.conf`，已配自动跳过），仅当脚本加速步失败时按本节补救：
+
+**Windows / macOS**（写入 podman machine，二选一）：
+
+- GUI（推荐）：Podman Desktop → Settings → **Registries** → Add registry，填 `docker.m.daocloud.io`
+- CLI（对 docker.io 全量生效）：
+
+```bash
+podman machine ssh
+sudo tee /etc/containers/registries.conf.d/999-mirror.conf > /dev/null <<'EOF'
+[[registry]]
+prefix = "docker.io"
+location = "docker.m.daocloud.io"
+EOF
+exit
+```
+
+**Linux**：同 CLI 写法，路径换 `~/.config/containers/registries.conf.d/999-mirror.conf`（目录不存在先 `mkdir -p`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
+
+> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的 ghcr 代理前缀（ghfast.top 等）或路线 C 离线包。
 
 ### 2.3 填鉴权文件（唯一要你编辑的文件）
 
