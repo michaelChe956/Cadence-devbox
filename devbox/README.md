@@ -94,7 +94,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
 | 3 | 配置国内镜像加速：daocloud mirror 写入宿主 `%APPDATA%\containers\registries.conf.d`（podman remote 客户端读取，中间件镜像走 docker.io） | §2.2.1 |
-| 4 | 建 16 个数据卷；拉主镜像（直连失败自动改走南大 ghcr 镜像 `ghcr.nju.edu.cn` 并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
+| 4 | 建 16 个数据卷；拉主镜像（**南大 ghcr 镜像优先**并 retag 成正式名，失败退直连）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
 **重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；16 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。

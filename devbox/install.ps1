@@ -108,26 +108,23 @@ $vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-
           'cadence-mysql-data','cadence-redis-data','cadence-rabbitmq-data','cadence-minio-data')
 foreach ($v in $vols) { if (-not (Probe "podman volume exists $v")) { podman volume create $v | Out-Null } }
 if (-not (Probe "podman image inspect $Image")) {
-  Info "拉取镜像 $Image（压缩 872MB，视网速 2–15 分钟）…"
-  podman pull $Image
-  if ($LASTEXITCODE -ne 0) {
-    # 直连失败 → 南大 ghcr 镜像回退（2026-09-11 podman 实拉实测：ghcr.nju.edu.cn 覆盖本包；
-    # daocloud 只接 docker.io 上游（中间件 mirror 专用）；ghfast/gh-proxy 等 gh 代理只适用于
-    # git clone/文件下载——均不能用于镜像拉取）
-    $px = $Image -replace '^ghcr\.io/', 'ghcr.nju.edu.cn/'
-    if ($px -eq $Image) { $px = $null }   # 非 ghcr 源无镜像回退
-    if ($px) {
-      Info "直连失败，尝试南大镜像：$px"
-      podman pull $px
-      if ($LASTEXITCODE -eq 0) {
-        podman tag $px $Image
-        podman rmi $px | Out-Null
-      } else { $px = $null }
-    }
-    if (-not $px) {
-      Warn "直连与南大镜像均失败：走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
-      Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
-    }
+  # 拉取顺序（2026-09-11 podman 实测）：南大 ghcr 镜像优先（国内快、覆盖本包），失败退直连，再失败走路线 C。
+  # 南大拉到后 retag 成 -Image 正式名，compose/.env 引用不受影响。
+  # 注：daocloud 只接 docker.io 上游（中间件 mirror 专用，见第 3 步）；ghfast/gh-proxy 等 gh 代理仅适用于 git clone。
+  $px = $Image -replace '^ghcr\.io/', 'ghcr.nju.edu.cn/'
+  $tries = @($px)
+  if ($px -ne $Image) { $tries += $Image }
+  $src = $null
+  foreach ($t in $tries) {
+    Info "拉取镜像：$t（压缩 872MB，视网速 2–15 分钟）…"
+    podman pull $t
+    if ($LASTEXITCODE -eq 0) { $src = $t; break }
+  }
+  if ($src) {
+    if ($src -ne $Image) { podman tag $src $Image; podman rmi $src | Out-Null }
+  } else {
+    Warn "南大与直连均失败：走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
+    Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
   }
 }
 podman-compose -f "$InstallDir\stack\compose.yaml" up -d mysql redis
