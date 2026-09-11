@@ -111,21 +111,21 @@ if (-not (Probe "podman image inspect $Image")) {
   Info "拉取镜像 $Image（压缩 872MB，视网速 2–15 分钟）…"
   podman pull $Image
   if ($LASTEXITCODE -ne 0) {
-    # 直连失败，依次尝试 ghcr 代理前缀（容器引用语法不带 https://），成功后 retag 为正式名
-    $proxies = @('ghfast.top/', 'gh-proxy.com/', 'mirror.ghproxy.com/')
-    $pulled = $false
-    foreach ($p in $proxies) {
-      $px = "${p}${Image}"
-      Info "直连失败，尝试代理：$px"
+    # 直连失败 → 南大 ghcr 镜像回退（2026-09-11 podman 实拉实测：ghcr.nju.edu.cn 覆盖本包；
+    # daocloud 只接 docker.io 上游（中间件 mirror 专用）；ghfast/gh-proxy 等 gh 代理只适用于
+    # git clone/文件下载——均不能用于镜像拉取）
+    $px = $Image -replace '^ghcr\.io/', 'ghcr.nju.edu.cn/'
+    if ($px -eq $Image) { $px = $null }   # 非 ghcr 源无镜像回退
+    if ($px) {
+      Info "直连失败，尝试南大镜像：$px"
       podman pull $px
-      if ($LASTEXITCODE -ne 0) { continue }
-      podman tag $px $Image
-      podman rmi $px | Out-Null
-      $pulled = $true
-      break
+      if ($LASTEXITCODE -eq 0) {
+        podman tag $px $Image
+        podman rmi $px | Out-Null
+      } else { $px = $null }
     }
-    if (-not $pulled) {
-      Warn "直连与代理均失败：可走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
+    if (-not $px) {
+      Warn "直连与南大镜像均失败：走 README §1 路线 C 离线 tar（podman load -i devbox-image.tar.gz）后以 -Image localhost/cadence-devbox:dev 重跑"
       Die '镜像不可用，终止（安装目录内容已就绪，重跑本脚本幂等）'
     }
   }

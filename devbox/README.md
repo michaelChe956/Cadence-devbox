@@ -16,14 +16,16 @@ devbox 是给**业务开发/测试人员**的一体化 AI 开发环境容器：�
 podman pull ghcr.io/michaelche956/cadence-devbox:latest
 ```
 
-直连慢/超时改用 ghcr 代理前缀拉取，再 retag 成正式名（install.ps1 已内置此回退）：
+直连慢/超时改用南大 ghcr 镜像拉取，再 retag 成正式名（install.ps1 已内置此回退）：
 
 ```bash
-podman pull ghfast.top/ghcr.io/michaelche956/cadence-devbox:latest
-podman tag ghfast.top/ghcr.io/michaelche956/cadence-devbox:latest ghcr.io/michaelche956/cadence-devbox:latest
+podman pull ghcr.nju.edu.cn/michaelche956/cadence-devbox:latest
+podman tag ghcr.nju.edu.cn/michaelche956/cadence-devbox:latest ghcr.io/michaelche956/cadence-devbox:latest
 ```
 
-tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。已验证匿名可拉；公共加速镜像（daocloud/南大）不覆盖 GHCR 个人包——国内直连慢用上面代理前缀或路线 C。
+> 各通道实测（2026-09-11，以 podman 实拉为准）：ghcr.io 直连匿名可拉；**ghcr.nju.edu.cn（南大）覆盖本包**；daocloud 只接 docker.io 上游（中间件 mirror 用，见 §2.2.1）；ghfast.top / gh-proxy.com / mirror.ghproxy.com 是 **git 加速代理**（§2.2 路 A 专用），不能拉镜像。
+
+tag 策略：`latest`（滚动）/ `1.0.0`（当前里程碑）/ `YYYY.WW`（周版，二期 CI 起提供）。已验证匿名可拉；国内直连慢用南大镜像或路线 C。
 
 **路线 B：国内 ACR（待开通，开通后此处回填地址）**
 
@@ -91,8 +93,8 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 |---|---|---|
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
-| 3 | 配置国内镜像加速：daocloud mirror 写入 podman machine（中间件镜像走 docker.io） | §2.2.1 |
-| 4 | 建 16 个数据卷；拉主镜像（直连失败自动依次试 ghfast.top / gh-proxy.com / mirror.ghproxy.com 三个 ghcr 代理并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
+| 3 | 配置国内镜像加速：daocloud mirror 写入宿主 `%APPDATA%\containers\registries.conf.d`（podman remote 客户端读取，中间件镜像走 docker.io） | §2.2.1 |
+| 4 | 建 16 个数据卷；拉主镜像（直连失败自动改走南大 ghcr 镜像 `ghcr.nju.edu.cn` 并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
 **重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；16 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。
@@ -176,6 +178,8 @@ podman volume ls | wc -l   # 应输出 16
 
 ### 2.2.1 国内镜像加速（手工安装直连慢/超时才配；一键脚本第 3 步已自动完成）
 
+> 实测（2026-09-11，podman 实拉）：mysql/redis/rabbitmq/minio 四镜像经 daocloud **全部秒级拉通**；南大 docker 镜像（docker.nju.edu.cn）403 不可用——中间件加速认准 daocloud，主镜像才用南大 ghcr（见 §1）。
+
 中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速。跑 §2.2 一键脚本的用户无需动手——脚本第 3 步自动写入下述同名文件（幂等），仅当脚本加速步失败时按本节补救：
 
 **Windows / macOS**（podman remote 客户端读**本机**配置并随 pull 生效，不进 machine；二选一）：
@@ -199,7 +203,7 @@ printf '[[registry]]\nprefix = "docker.io"\nlocation = "docker.m.daocloud.io"\n'
 
 > ⚠️ 别用 `podman machine ssh` 往 machine 的 `/etc/containers/` 写——remote 场景 pull 读的是客户端本机配置，写 machine 里不生效。
 
-> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的 ghcr 代理前缀（ghfast.top 等）或路线 C 离线包。
+> devbox 主镜像在 ghcr.io：上面的 daocloud mirror 只管 docker.io，对 ghcr.io 无效——主镜像拉不动用 §1 的南大镜像（ghcr.nju.edu.cn）或路线 C 离线包。
 
 ### 2.3 填鉴权文件（唯一要你编辑的文件）
 
