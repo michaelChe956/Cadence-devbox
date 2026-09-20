@@ -89,10 +89,11 @@ if (Test-Path "$InstallDir\stack\.env") {
 Info "请编辑 $InstallDir\cadence-box.yaml 填写 provider 端点/key/模型（git.name/email 也要填）"
 $done = Read-Host '填完后按回车继续（Ctrl+C 退出先去填）'
 
-# ---- 第 3 步：宿主侧写 registry mirror（README §2.2.1） ----
-# podman remote 机制：Windows 客户端读本机 %APPDATA%\containers 配置并随 pull 生效——不用 machine ssh。
-# 无条件重写（内容固定幂等，兼自愈旧坏文件）；同时清理旧版脚本误写进 machine 的尝试（若有）。
-Info '第 3/5 步：配置镜像加速（daocloud mirror → 宿主 registries.conf.d）'
+# ---- 第 3 步：写 registry mirror 到宿主与 podman machine 两侧（README §2.2.1） ----
+# 2026-09-20 Windows 实测修正：pull 在 machine（WSL/HyperV VM）内执行、读 VM 的 /etc/containers 配置
+# （日志证据：Resolving ... using unqualified-search registries /usr/share/.../999-podman-machine.conf）——
+# 只写宿主 %APPDATA% 对 docker.io 拉取不生效；两侧都写，幂等。
+Info '第 3/5 步：配置镜像加速（daocloud mirror → 宿主 + podman machine）'
 $confDir = Join-Path $env:APPDATA 'containers\registries.conf.d'
 New-Item -ItemType Directory -Force -Path $confDir | Out-Null
 $confFile = Join-Path $confDir '999-mirror.conf'
@@ -114,7 +115,16 @@ Get-ChildItem "$confDir\*.conf" | ForEach-Object {
     Warn "已绕过（Podman Desktop 之后会自行重建该文件）"
   }
 }
-Probe "podman machine ssh 'sudo rm -f /etc/containers/registries.conf.d/999-mirror.conf'" | Out-Null
+# machine 侧写入：cp 到 VM 家目录再 sudo mv（ssh 内嵌 heredoc 的多层引号转义太脆，不采用）
+$mach = (podman machine inspect --format '{{.Name}}' | Select-Object -First 1).Trim()
+podman machine cp "$confFile" "${mach}:999-mirror.conf"
+if ($LASTEXITCODE -ne 0) {
+  Warn 'machine cp 失败：中间件镜像将直连 docker.io（国内可能超时）；可手动把 999-mirror.conf 放进 machine 的 /etc/containers/registries.conf.d/'
+} else {
+  podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
+  if ($LASTEXITCODE -ne 0) { Warn '写入 machine 侧 mirror 失败：中间件镜像将直连 docker.io（国内可能超时）' }
+  else { Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf' }
+}
 
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
 Info '第 4/5 步：创建数据卷并启动'

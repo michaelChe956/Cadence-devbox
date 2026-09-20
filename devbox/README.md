@@ -97,7 +97,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 |---|---|---|
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
-| 3 | 配置国内镜像加速：daocloud mirror 写入宿主 `%APPDATA%\containers\registries.conf.d`（podman remote 客户端读取，中间件镜像走 docker.io） | §2.2.1 |
+| 3 | 配置国内镜像加速：daocloud mirror 写入**宿主 `%APPDATA%` 与 podman machine `/etc/containers` 两侧**（pull 实际在 machine 内执行，只写宿主侧不生效） | §2.2.1 |
 | 4 | 建 16 个数据卷；拉主镜像（默认**阿里云 ACR**；若 `-Image` 是 ghcr 源则南大优先、失败退直连并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
@@ -186,21 +186,26 @@ podman volume ls | wc -l   # 应输出 16
 
 中间件镜像（mysql/redis/rabbitmq/minio）都在 docker.io，直连拉不动时配 daocloud 公共加速。跑 §2.2 一键脚本的用户无需动手——脚本第 3 步自动写入下述同名文件（幂等），仅当脚本加速步失败时按本节补救：
 
-**Windows / macOS**（podman remote 客户端读**本机**配置并随 pull 生效，不进 machine；二选一）：
+**Windows / macOS**（2026-09-20 Windows 实测修正：**pull 在 podman machine（WSL/HyperV VM）内执行、读 VM 的 `/etc/containers` 配置**——日志证据 `Resolving … using unqualified-search registries /usr/share/…/999-podman-machine.conf`。只写宿主本机配置对 docker.io 拉取不生效，两侧都要写；install.ps1 第 3 步已自动完成）：
 
-- GUI（推荐）：Podman Desktop → Settings → **Registries** → Add registry，填 `docker.m.daocloud.io`
-- 手写 mirror 文件（对 docker.io 全量生效）。Windows（PowerShell）：
+PowerShell（宿主侧 + machine 侧；`$mach` 为机器名，默认 `podman-machine-default`）：
 
 ```powershell
 $d = "$env:APPDATA\containers\registries.conf.d"; mkdir $d -Force | Out-Null
 @('[[registry]]','prefix = "docker.io"','location = "docker.m.daocloud.io"','') | Set-Content "$d\999-mirror.conf"
+$mach = (podman machine inspect --format '{{.Name}}' | Select-Object -First 1).Trim()
+podman machine cp "$d\999-mirror.conf" "${mach}:999-mirror.conf"
+podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
 ```
 
-  macOS（bash）：
+  macOS（bash，宿主侧 + machine 侧同理）：
 
 ```bash
 mkdir -p ~/.config/containers/registries.conf.d
 printf '[[registry]]\nprefix = "docker.io"\nlocation = "docker.m.daocloud.io"\n' > ~/.config/containers/registries.conf.d/999-mirror.conf
+mach=$(podman machine inspect --format '{{.Name}}' | head -1)
+podman machine cp ~/.config/containers/registries.conf.d/999-mirror.conf "${mach}:999-mirror.conf"
+podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
 ```
 
 **Linux**：同 macOS 写法（`~/.config/containers/registries.conf.d/`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
