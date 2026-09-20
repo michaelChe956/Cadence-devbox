@@ -153,7 +153,7 @@ Copy-Item "$repo\cadence-box.yaml.example"         C:\cadence\cadence-box.yaml
 
 ```powershell
 @"
-CADENCE_WORKSPACE=D:\code
+CADENCE_WORKSPACE=D:/code
 CADENCE_DEVBOX_IMAGE=crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest
 COMPOSE_PROFILES=
 "@ | Set-Content -Encoding utf8 C:\cadence\stack\.env
@@ -431,6 +431,8 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 2. **新仓库避免换行符幻影 diff**：仓库根加 `.gitattributes`：`* text=auto eol=lf`
 3. **宿主与容器同时跑 git 偶发 index.lock**：瞬时锁，重试即可；agent 提交时避免宿主同时操作
 4. **dev server 收不到宿主侧文件改动**：镜像已默认 `CHOKIDAR_USEPOLLING=1`（vite）；spring-boot-devtools 需在配置中开启轮询：`spring.devtools.restart.poll-interval=1s` + `quiet-period=0.8s`
+5. **Windows 上 `podman pull` 报 `…registries.conf.d\999-…conf: The file cannot be accessed by the system`**：Podman Desktop 生成的该文件系统层不可读，会卡死一切镜像拉取——install.ps1 第 3 步已自动改名 `.unreadable.bak` 绕过；手工安装则手动删除该文件
+6. **podman-compose 报 `unknown mount option /workspace`**：短语法挂载按 `:` 切分，Windows 盘符路径（`D:/code:/workspace`）被切成三段——compose.yaml 的 workspace 挂载已用长语法 `type: bind` 规避，旧安装目录请删除 `stack\compose.yaml` 重跑 install.ps1 重新生成
 
 ## 8. Windows 真机验收（待执行——第一期交付后由维护者在真机完成）
 

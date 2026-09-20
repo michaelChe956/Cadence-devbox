@@ -37,7 +37,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ".:/cadence/stack"
       - "../cadence-box.yaml:/cadence/auth.yaml:ro"
-      - "${CADENCE_WORKSPACE:?请在 stack/.env 设置 CADENCE_WORKSPACE（宿主代码父目录绝对路径）}:/workspace"
+      # 长语法 bind：podman-compose 短语法按":"切分，Windows 盘符路径 D:/x 会被切坏（unknown mount option）
+      - type: bind
+        source: "${CADENCE_WORKSPACE:?请在 stack/.env 设置 CADENCE_WORKSPACE（宿主代码父目录绝对路径）}"
+        target: /workspace
       - cadence-claude:/home/dev/.claude
       - cadence-codex:/home/dev/.codex
       - cadence-pi:/home/dev/.pi/agent

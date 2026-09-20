@@ -98,6 +98,18 @@ New-Item -ItemType Directory -Force -Path $confDir | Out-Null
 $confFile = Join-Path $confDir '999-mirror.conf'
 @('[[registry]]', 'prefix = "docker.io"', 'location = "docker.m.daocloud.io"', '') | Set-Content -Path $confFile -Encoding ascii
 Info "已写入 $confFile"
+# 自愈：registries.conf.d 里系统层不可读的 .conf 会卡死一切 podman pull（实测 Windows 上
+# Podman Desktop 生成的 999-podman-desktop-registries-from-host.conf 可报 "cannot be accessed by the system"）。
+# containers/image 只读 *.conf——改名 .bak 即绕过，Podman Desktop 之后会自行重建。
+Get-ChildItem "$confDir\*.conf" | ForEach-Object {
+  try { Get-Content -Raw -LiteralPath $_.FullName -ErrorAction Stop | Out-Null }
+  catch {
+    try {
+      Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).unreadable.bak" -ErrorAction Stop
+      Warn "registries.conf.d\$($_.Name) 系统无法读取（会卡死 podman pull），已改名 .unreadable.bak 绕过"
+    } catch { Warn "registries.conf.d\$($_.Name) 系统无法读取且改名失败——请手动删除该文件后重跑：$($_.FullName)" }
+  }
+}
 Probe "podman machine ssh 'sudo rm -f /etc/containers/registries.conf.d/999-mirror.conf'" | Out-Null
 
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----

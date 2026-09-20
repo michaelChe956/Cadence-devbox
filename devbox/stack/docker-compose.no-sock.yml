@@ -6,7 +6,9 @@ services:
     volumes: !override
       - ".:/cadence/stack"
       - "../cadence-box.yaml:/cadence/auth.yaml:ro"
-      - "${CADENCE_WORKSPACE:?请在 stack/.env 设置 CADENCE_WORKSPACE}:/workspace"
+      - type: bind
+        source: "${CADENCE_WORKSPACE:?请在 stack/.env 设置 CADENCE_WORKSPACE}"
+        target: /workspace
       - cadence-claude:/home/dev/.claude
       - cadence-codex:/home/dev/.codex
       - cadence-pi:/home/dev/.pi/agent

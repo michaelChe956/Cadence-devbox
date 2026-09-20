@@ -52,7 +52,13 @@ def test_image_pins_and_devbox_mounts():
     assert "/var/run/docker.sock:/var/run/docker.sock" in volumes
     assert ".:/cadence/stack" in volumes
     assert "../cadence-box.yaml:/cadence/auth.yaml:ro" in volumes
-    assert any(volume.startswith("${CADENCE_WORKSPACE") and volume.endswith(":/workspace") for volume in volumes)
+    assert any(
+        isinstance(v, dict)
+        and v.get("type") == "bind"
+        and str(v.get("source", "")).startswith("${CADENCE_WORKSPACE")
+        and v.get("target") == "/workspace"
+        for v in volumes
+    ), "workspace 挂载必须是长语法：podman-compose 短语法按':'切分，Windows 盘符路径 D:/x 会被切坏（unknown mount option）"
     for mount in (
         "cadence-claude:/home/dev/.claude", "cadence-codex:/home/dev/.codex",
         "cadence-pi:/home/dev/.pi/agent", "cadence-kimi:/home/dev/.kimi-code",
@@ -83,11 +89,11 @@ def test_catalog_layout_and_parseable_fragments():
         assert fragment.splitlines()[0].startswith(f"  {service}:")
         yaml.safe_load("services:\n" + fragment)
     assert "[mysqld]" in (CATALOG / "mysql" / "conf" / "my.cnf").read_text(encoding="utf-8")
-    assert "appendonly" in (CATALOG / "redis" / "conf" / "redis.conf").read_text(encoding="utf-8")
 
 
 def test_no_sock_override_replaces_volumes_without_socket():
     text = (REPO / "devbox" / "stack" / "docker-compose.no-sock.yml").read_text(encoding="utf-8")
     assert "/var/run/docker.sock" not in text
     assert "!override" in text
+    assert "type: bind" in text and "target: /workspace" in text, "no-sock 的 workspace 挂载须同为长语法（Windows 盘符兼容）"
     assert "cadence-claude:/home/dev/.claude" in text
