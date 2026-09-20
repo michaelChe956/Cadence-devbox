@@ -134,9 +134,11 @@ if ($LASTEXITCODE -ne 0) {
   podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
   if ($LASTEXITCODE -ne 0) { Warn '写入 machine 侧 mirror 失败：中间件镜像将直连 docker.io（国内可能超时）' }
   elseif ($needRestart) {
-    Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf；重启 podman machine 使 mirror 生效（约 0.5–1 分钟）…'
-    podman machine restart
-    if ($LASTEXITCODE -ne 0) { Warn 'machine 重启失败：若中间件拉取仍直连超时，请手动 podman machine restart 后重跑' }
+    Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf；重启 podman machine 使 mirror 生效（约 1–2 分钟）…'
+    # machine restart 子命令 podman 6.1 才有（6.0.2 Windows 实测 unrecognized command）——stop+start 等效全量重启
+    podman machine stop
+    podman machine start
+    if ($LASTEXITCODE -ne 0) { Warn 'machine 重启失败：若中间件拉取仍直连超时，请手动执行 podman machine stop; podman machine start 后重跑' }
   } else { Info 'machine 侧 mirror 无变化且中间件已在运行（上次已生效）——跳过重启' }
 }
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
