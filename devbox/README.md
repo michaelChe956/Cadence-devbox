@@ -196,6 +196,7 @@ $d = "$env:APPDATA\containers\registries.conf.d"; mkdir $d -Force | Out-Null
 $mach = (podman machine inspect --format '{{.Name}}' | Select-Object -First 1).Trim()
 podman machine cp "$d\999-mirror.conf" "${mach}:999-mirror.conf"
 podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
+podman machine restart   # 关键：machine 内常驻 API service 缓存 registries 配置，不重启则新 mirror 不生效
 ```
 
   macOS（bash，宿主侧 + machine 侧同理）：
@@ -206,6 +207,7 @@ printf '[[registry]]\nprefix = "docker.io"\nlocation = "docker.m.daocloud.io"\n'
 mach=$(podman machine inspect --format '{{.Name}}' | head -1)
 podman machine cp ~/.config/containers/registries.conf.d/999-mirror.conf "${mach}:999-mirror.conf"
 podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
+podman machine restart   # 关键：machine 内常驻 API service 缓存 registries 配置，不重启则新 mirror 不生效
 ```
 
 **Linux**：同 macOS 写法（`~/.config/containers/registries.conf.d/`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。

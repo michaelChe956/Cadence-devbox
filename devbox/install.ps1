@@ -123,9 +123,15 @@ if ($LASTEXITCODE -ne 0) {
 } else {
   podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
   if ($LASTEXITCODE -ne 0) { Warn '写入 machine 侧 mirror 失败：中间件镜像将直连 docker.io（国内可能超时）' }
-  else { Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf' }
+  else {
+    Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf'
+    # machine 内常驻 API service 进程会缓存 registries 配置（本机 6.1.1 实测：热进程无视新 drop-in、
+    # 新进程立即生效）——必须重启 machine 才能让 mirror 对后续 pull 生效
+    Info '重启 podman machine 使 mirror 生效（约 0.5–1 分钟）…'
+    podman machine restart
+    if ($LASTEXITCODE -ne 0) { Warn 'machine 重启失败：若中间件拉取仍直连超时，请手动 podman machine restart 后重跑' }
+  }
 }
-
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
 Info '第 4/5 步：创建数据卷并启动'
 $vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-agents','cadence-omp',
