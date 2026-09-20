@@ -102,12 +102,16 @@ Info "已写入 $confFile"
 # Podman Desktop 生成的 999-podman-desktop-registries-from-host.conf 可报 "cannot be accessed by the system"）。
 # containers/image 只读 *.conf——改名 .bak 即绕过，Podman Desktop 之后会自行重建。
 Get-ChildItem "$confDir\*.conf" | ForEach-Object {
-  try { Get-Content -Raw -LiteralPath $_.FullName -ErrorAction Stop | Out-Null }
+  $f = $_   # 注意：catch 块内 $_ 是异常对象——文件对象必须先存变量
+  try { Get-Content -Raw -LiteralPath $f.FullName -ErrorAction Stop | Out-Null }
   catch {
-    try {
-      Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).unreadable.bak" -ErrorAction Stop
-      Warn "registries.conf.d\$($_.Name) 系统无法读取（会卡死 podman pull），已改名 .unreadable.bak 绕过"
-    } catch { Warn "registries.conf.d\$($_.Name) 系统无法读取且改名失败——请手动删除该文件后重跑：$($_.FullName)" }
+    Warn "registries.conf.d\$($f.Name) 系统无法读取（会卡死一切 podman pull）——尝试绕过"
+    try { Rename-Item -LiteralPath $f.FullName -NewName "$($f.Name).unreadable.bak" -ErrorAction Stop }
+    catch { try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch {} }
+    if (Test-Path -LiteralPath $f.FullName) {
+      Die "无法绕过不可读的 $($f.FullName)——请手动删除后重跑：Remove-Item -LiteralPath '$($f.FullName)' -Force"
+    }
+    Warn "已绕过（Podman Desktop 之后会自行重建该文件）"
   }
 }
 Probe "podman machine ssh 'sudo rm -f /etc/containers/registries.conf.d/999-mirror.conf'" | Out-Null
