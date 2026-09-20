@@ -210,7 +210,7 @@ podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -
 podman machine restart   # 关键：machine 内常驻 API service 缓存 registries 配置，不重启则新 mirror 不生效
 ```
 
-**Linux**：同 macOS 写法（`~/.config/containers/registries.conf.d/`）。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
+**Linux**（原生 podman，**无 machine**——上面 macOS 块里的 `machine cp/ssh/restart` 三步不适用，只写宿主侧即生效）：`mkdir -p ~/.config/containers/registries.conf.d` 后同 macOS 的 printf 写法。§2.5 三件套里的 `unqualified-search-registries` 是等效的另一写法，配过其一即可。
 
 > devbox 主镜像：首选 §1 路线 A（阿里云 ACR，免代理直拉）；走 GHCR 时注意上面的 daocloud mirror 只管 docker.io——拉不动用南大镜像（ghcr.nju.edu.cn）或路线 C 离线包。
 

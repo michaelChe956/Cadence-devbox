@@ -89,6 +89,7 @@ def test_catalog_layout_and_parseable_fragments():
         assert fragment.splitlines()[0].startswith(f"  {service}:")
         yaml.safe_load("services:\n" + fragment)
     assert "[mysqld]" in (CATALOG / "mysql" / "conf" / "my.cnf").read_text(encoding="utf-8")
+    assert "appendonly" in (CATALOG / "redis" / "conf" / "redis.conf").read_text(encoding="utf-8")
 
 
 def test_no_sock_override_replaces_volumes_without_socket():

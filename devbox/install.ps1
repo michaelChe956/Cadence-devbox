@@ -106,31 +106,38 @@ Get-ChildItem "$confDir\*.conf" | ForEach-Object {
   $f = $_   # 注意：catch 块内 $_ 是异常对象——文件对象必须先存变量
   try { Get-Content -Raw -LiteralPath $f.FullName -ErrorAction Stop | Out-Null }
   catch {
-    Warn "registries.conf.d\$($f.Name) 系统无法读取（会卡死一切 podman pull）——尝试绕过"
+    # 只自动处理 Podman Desktop 生成物（实测损坏者）；其他文件读失败可能是暂时性占用，不动、只提示
+    if ($f.Name -notlike '999-podman-desktop-*') {
+      Warn "registries.conf.d\$($f.Name) 暂时无法读取（持续存在会卡死 podman pull）——非 Podman Desktop 生成文件，不自动处理；确认无用可删除：$($f.FullName)"
+      return
+    }
+    Warn "registries.conf.d\$($f.Name) 系统无法读取（Podman Desktop 生成物损坏，会卡死一切 podman pull）——尝试绕过"
     try { Rename-Item -LiteralPath $f.FullName -NewName "$($f.Name).unreadable.bak" -ErrorAction Stop }
     catch { try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch {} }
     if (Test-Path -LiteralPath $f.FullName) {
-      Die "无法绕过不可读的 $($f.FullName)——请手动删除后重跑：Remove-Item -LiteralPath '$($f.FullName)' -Force"
-    }
-    Warn "已绕过（Podman Desktop 之后会自行重建该文件）"
+      Warn "自动绕过失败——请手动删除后重跑：Remove-Item -LiteralPath '$($f.FullName)' -Force"
+    } else { Warn "已绕过（Podman Desktop 之后会自行重建该文件）" }
   }
 }
-# machine 侧写入：cp 到 VM 家目录再 sudo mv（ssh 内嵌 heredoc 的多层引号转义太脆，不采用）
+# machine 侧写入：cp 到 VM 家目录再 sudo mv（ssh 内嵌 heredoc 的多层引号转义太脆，不采用）。
+# machine 内常驻 API service 进程缓存 registries 配置（本机 6.1.1 实测：热进程无视新 drop-in、
+# 新进程立即生效）——仅当内容有变化、或中间件尚未跑起来（安装未完成，缓存多半还是无 mirror 的旧状态）时重启；
+# 内容未变且 mysql 已在跑说明上次已生效，跳过重启避免打断。
 $mach = (podman machine inspect --format '{{.Name}}' | Select-Object -First 1).Trim()
+$oldMirror = (podman machine ssh 'sudo cat /etc/containers/registries.conf.d/999-mirror.conf 2>/dev/null' | Out-String).Trim()
+$newMirror = (Get-Content -Raw -LiteralPath $confFile).Trim()
+$needRestart = ($oldMirror -ne $newMirror) -or (-not (Probe 'podman container inspect cadence_mysql_1'))
 podman machine cp "$confFile" "${mach}:999-mirror.conf"
 if ($LASTEXITCODE -ne 0) {
   Warn 'machine cp 失败：中间件镜像将直连 docker.io（国内可能超时）；可手动把 999-mirror.conf 放进 machine 的 /etc/containers/registries.conf.d/'
 } else {
   podman machine ssh 'sudo mkdir -p /etc/containers/registries.conf.d && sudo mv -f ~/999-mirror.conf /etc/containers/registries.conf.d/999-mirror.conf'
   if ($LASTEXITCODE -ne 0) { Warn '写入 machine 侧 mirror 失败：中间件镜像将直连 docker.io（国内可能超时）' }
-  else {
-    Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf'
-    # machine 内常驻 API service 进程会缓存 registries 配置（本机 6.1.1 实测：热进程无视新 drop-in、
-    # 新进程立即生效）——必须重启 machine 才能让 mirror 对后续 pull 生效
-    Info '重启 podman machine 使 mirror 生效（约 0.5–1 分钟）…'
+  elseif ($needRestart) {
+    Info '已写入 machine /etc/containers/registries.conf.d/999-mirror.conf；重启 podman machine 使 mirror 生效（约 0.5–1 分钟）…'
     podman machine restart
     if ($LASTEXITCODE -ne 0) { Warn 'machine 重启失败：若中间件拉取仍直连超时，请手动 podman machine restart 后重跑' }
-  }
+  } else { Info 'machine 侧 mirror 无变化且中间件已在运行（上次已生效）——跳过重启' }
 }
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
 Info '第 4/5 步：创建数据卷并启动'
