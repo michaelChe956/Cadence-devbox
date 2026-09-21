@@ -2,7 +2,7 @@
 
 > 版本：第一期（2026-09-11）｜ 运行时：**podman**（Windows/macOS/Linux 三平台统一）｜ 镜像压缩体积 872MB ｜ 内置：claude 2.1.247 / codex 0.153.4 / pi 0.85.0 / omp 18.1.17（bun 1.4.2）/ kimi（官方安装器）+ JDK21 + Maven 3.9.16 + Node 24.21.0 + uv 0.12.11 + mysql/redis/rabbitmq/minio 编排
 > 完整设计见 `cadence/designs/2026-09-11_方案设计_Cadence-skills一体化开发环境容器devbox_v1.0.md`
-> 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测，Windows/macOS 路线待 §8 真机验收。
+> 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测（一期验收+E2E），**Windows 真机验收已通过**（见 §8），macOS 路线待真机验证。
 
 ## 0. 这是什么、为什么（背景与目的）
 
@@ -291,7 +291,7 @@ Linux 下 devbox 启动命令在 §2.4 基础上**必须加 `--userns=keep-id`**
 | 平台 | 状态 | 差异 |
 |---|---|---|
 | Linux rootless podman | ✅ 已实测（一期验收+E2E） | `--userns=keep-id` 必需；cgroupfs 配置；rabbitmq 命名卷权限问题（mysql/redis/minio 正常） |
-| Windows Podman Desktop | ⏳ 待 §8 真机验证 | machine 默认 rootful，理论免 keep-id/cgroup 配置；宿主路径自动映射进 machine |
+| Windows Podman Desktop | ✅ 已验收（2026-09-21，见 §8） | machine 默认 rootful，免 keep-id/cgroup 配置；宿主路径自动映射进 machine |
 | macOS podman machine | ⏳ 待真机验证 | 同上（Apple 虚拟化） |
 
 stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适配 podman 双形态。
@@ -441,7 +441,7 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 5. **Windows 上 `podman pull` 报 `…registries.conf.d\999-…conf: The file cannot be accessed by the system`**：Podman Desktop 生成的该文件系统层不可读，会卡死一切镜像拉取——install.ps1 第 3 步已自动改名 `.unreadable.bak` 绕过；手工安装则手动删除该文件
 6. **podman-compose 报 `unknown mount option /workspace`**：短语法挂载按 `:` 切分，Windows 盘符路径（`D:/code:/workspace`）被切成三段——compose.yaml 的 workspace 挂载已用长语法 `type: bind` 规避，旧安装目录请删除 `stack\compose.yaml` 重跑 install.ps1 重新生成
 
-## 8. Windows 真机验收（待执行——第一期交付后由维护者在真机完成）
+## 8. Windows 真机验收（已执行：2026-09-21，维护者 michaelChe）
 
 ### 8.1 执行指引
 
@@ -467,12 +467,16 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 
 ### 8.2 验收清单（设计文档「七、验证口径」）
 
-- [ ] 1.【真机人工】装机到进终端（留证：机型、Podman/镜像版本、网络环境、命令、录屏）——**Linux 侧已预覆盖安装布局逻辑**
-- [ ] 2. 改 `cadence-box.yaml` 换 key/模型 → 重启容器 → 五端按新配置工作；容器销毁重建配置仍生效——**已预覆盖**（渲染 6 文件 + exit 2 拒启，46 项测试；真机补真实 key 验证）
-- [ ] 3.【真机实测，设门】容器内 mvn/npm create/uv init 各 <3 分钟——**参考计时已取**（mvn 15s/spring-boot 依赖 20s/vite 0.7s/uv 0.1s）
-- [ ] 4.【真机人工】宿主改文件 5 秒热更 + 无幻影 diff（留证：改文件时间、热更与 git status/diff 截图）
-- [ ] 5. skills 首启投影 + 体积 ≤1GB——**已达标**（872MB；devbox-stack skill 待仓库 merge 后随 install.sh 投影）
-- [ ] 6.【真机】中间件全链路（含 minio 上传）——**Linux 容器侧已预覆盖**（Spring+Vue+MySQL+Redis 全链路实测，2 个连接串模板 bug 已修复）
+- [x] 1. 装机到进终端——**通过**（维护者真机确认）
+- [x] 2. 改 `cadence-box.yaml` 换 key/模型 → 重启容器 → 五端按新配置工作；容器销毁重建配置仍生效——**通过**（维护者真机确认）
+- [x] 3. 容器内 mvn/npm create/uv init 各 <3 分钟——**通过**（维护者真机确认）
+- [x] 4. 宿主改文件 5 秒热更 + 无幻影 diff——**通过**（维护者真机确认）
+- [x] 5. skills 首启投影 + 体积 ≤1GB——**通过**（镜像压缩体积 872MB）
+- [x] 6. 中间件全链路（含 minio 上传）——**通过**（维护者真机确认）
+
+> **留证情况**：本次真机的机型、Podman/镜像版本、网络环境、各项实测数值与录屏/截图**未留存**（维护者确认结果通过，细节数据未归档）。
+> 因此本清单只记录结论，不记录数值；后续需要数值证据时按 §8.1 重新执行并留证。
+> 第 3 项的时间门与第 4 项的 5 秒热更为设计「七、验证口径」的验收门槛，本次按维护者确认为通过。
 
 ## 9. 镜像构建信息
 
