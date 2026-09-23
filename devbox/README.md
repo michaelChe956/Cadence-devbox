@@ -3,6 +3,7 @@
 > 版本：第一期（2026-09-11）｜ 运行时：**podman**（Windows/macOS/Linux 三平台统一）｜ 镜像压缩体积 872MB ｜ 内置：claude 2.1.247 / codex 0.153.4 / pi 0.85.0 / omp 18.1.17（bun 1.4.2）/ kimi（官方安装器）+ JDK21 + Maven 3.9.16 + Node 24.21.0 + uv 0.12.11 + mysql/redis/rabbitmq/minio 编排
 > 完整设计见 `cadence/designs/2026-09-11_方案设计_Cadence-skills一体化开发环境容器devbox_v1.0.md`
 > 说明：工具链对接的是 docker 兼容协议（sock/命令语义），全程使用 podman 运行；Linux 路线已实测（一期验收+E2E），**Windows 真机验收已通过**（见 §8），macOS 路线待真机验证。
+> JDK 选择（`jdk list` / `jdk use 8|21`，含完整 OpenJDK 8 按需安装与跨重建持久）见 §3.1；其验证状态也记在该节（Linux 实测，Windows/Gradle 未实测）。
 
 ## 0. 这是什么、为什么（背景与目的）
 
@@ -98,10 +99,10 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 | 1 | 检测 podman；machine 未建自动 `init`、未运行自动 `start`；检测 podman-compose | §2.1 |
 | 2 | 建安装目录，拷 compose/no-sock/catalog，生成 cadence-box.yaml 密钥模板 + .env + .gitignore，**中途暂停等你填密钥** | §2.2 下文/§2.3 |
 | 3 | 配置国内镜像加速：daocloud mirror 写入**宿主 `%APPDATA%` 与 podman machine `/etc/containers` 两侧**（pull 实际在 machine 内执行，只写宿主侧不生效） | §2.2.1 |
-| 4 | 建 16 个数据卷；拉主镜像（默认**阿里云 ACR**；若 `-Image` 是 ghcr 源则南大优先、失败退直连并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
+| 4 | 建 17 个数据卷（含 JDK 状态卷 `cadence-jdks`）；拉主镜像（默认**阿里云 ACR**；若 `-Image` 是 ghcr 源则南大优先、失败退直连并 retag）；起 mysql/redis；起 devbox 并等待「就绪」日志 | §2.2 第 4 步/§2.4 |
 | 5 | 打印后续使用提示（进容器/换 key/开中间件/日常开关机） | §3 |
 
-**重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；16 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。
+**重跑安全**：已存在的 cadence-box.yaml、stack\compose.yaml（含 `stack add` 自加的服务）、catalog、.env 一律保留不覆盖；17 个卷的数据零影响；仅重建 devbox 容器。中途失败从头重跑即可（幂等）。
 
 以下手工步骤供 macOS/Linux 用户、或想逐条理解/脚本不可用时使用：
 
@@ -164,21 +165,23 @@ COMPOSE_PROFILES=
 
 **第 4 步：创建数据卷（external 卷需预建，一次性）**
 
-compose.yaml 里 16 个卷全部声明 `external: true`——podman-compose 只挂载、不创建，卷不存在则启动直接报错；预建后数据与容器生命周期解耦（`down -v`、`system prune` 都删不掉，重建容器/升级镜像数据全在）。三步：
+compose.yaml 里 17 个卷全部声明 `external: true`——podman-compose 只挂载、不创建，卷不存在则启动直接报错；预建后数据与容器生命周期解耦（`down -v`、`system prune` 都删不掉，重建容器/升级镜像数据全在）。三步：
 
 ```powershell
 podman machine start     # ① 确保 machine 在跑（已启动会提示 already running，继续即可）
-# ② 整行复制粘贴——16 个卷逐个创建约 1 秒；重复执行无害（已存在的报错跳过）
-"cadence-claude","cadence-codex","cadence-pi","cadence-kimi","cadence-agents","cadence-omp","cadence-m2","cadence-npm","cadence-npm-global","cadence-uv","cadence-pip","cadence-gradle","cadence-mysql-data","cadence-redis-data","cadence-rabbitmq-data","cadence-minio-data" | ForEach-Object { podman volume create $_ }
-podman volume ls         # ③ 验证：列出 16 行 cadence- 开头的卷
+# ② 整行复制粘贴——17 个卷逐个创建约 1 秒；重复执行无害（已存在的报错跳过）
+"cadence-claude","cadence-codex","cadence-pi","cadence-kimi","cadence-agents","cadence-omp","cadence-jdks","cadence-m2","cadence-npm","cadence-npm-global","cadence-uv","cadence-pip","cadence-gradle","cadence-mysql-data","cadence-redis-data","cadence-rabbitmq-data","cadence-minio-data" | ForEach-Object { podman volume create $_ }
+podman volume ls --format "{{.Name}}" | Select-String "^cadence-"    # ③ 验证：应列出 17 行 cadence- 开头的卷
 ```
 
 macOS/Linux 等价命令（bash 循环）：
 
 ```bash
-for v in cadence-claude cadence-codex cadence-pi cadence-kimi cadence-agents cadence-omp cadence-m2 cadence-npm cadence-npm-global cadence-uv cadence-pip cadence-gradle cadence-mysql-data cadence-redis-data cadence-rabbitmq-data cadence-minio-data; do podman volume create "$v"; done
-podman volume ls | wc -l   # 应输出 16
+for v in cadence-claude cadence-codex cadence-pi cadence-kimi cadence-agents cadence-omp cadence-jdks cadence-m2 cadence-npm cadence-npm-global cadence-uv cadence-pip cadence-gradle cadence-mysql-data cadence-redis-data cadence-rabbitmq-data cadence-minio-data; do podman volume create "$v"; done
+podman volume ls --format '{{.Name}}' | grep -c '^cadence-'   # 应输出 17
 ```
+
+> 已有安装（一期镜像）**升级到含 JDK 选择特性的版本时必须补建 `cadence-jdks`**：external 卷 compose 不会自建，缺它会直接启动失败。重跑 install.ps1（幂等）或手工 `podman volume create cadence-jdks` 即可，不会动其它卷的数据。详见 §6。
 
 ### 2.2.1 国内镜像加速（手工安装直连慢/超时才配；一键脚本第 3 步已自动完成）
 
@@ -251,6 +254,7 @@ podman run -d --name devbox --network cadence_default `
   -v C:\cadence\cadence-box.yaml:/cadence/auth.yaml:ro `
   -v C:\cadence\stack:/cadence/stack `
   -v D:\code:/workspace `
+  -v cadence-jdks:/home/dev/.cadence/jdks `
   -v /var/run/podman/podman.sock:/var/run/docker.sock `
   -p 127.0.0.1:3000:3000 -p 127.0.0.1:8080:8080 `
   ghcr.io/michaelche956/cadence-devbox:latest
@@ -258,6 +262,9 @@ podman run -d --name devbox --network cadence_default `
 podman logs devbox | Select-Object -Last 3     # 应见「就绪」
 podman exec -it devbox bash                    # 进入容器
 ```
+
+- `-v cadence-jdks:/home/dev/.cadence/jdks` 是 **JDK 选择的状态卷**（§3.1）：不挂它就只是容器内临时状态，`podman rm` 重建后回到内置 21。卷需先按 §2.2 第 4 步预建。
+- 挂载取舍：`podman run` 路线只挂**必需项**（鉴权文件、stack、workspace、JDK 状态卷）；`compose.yaml` 的 devbox 服务还会把另外 16 个缓存/登录态卷（`.claude`/`.codex`/`.m2`/…）一起挂上，让登录态与依赖缓存在容器重建后仍在。两条路线都能跑——五端配置每次启动都会按 `cadence-box.yaml` 重新渲染。
 
 macOS/Linux 同命令（路径换 `~/cadence/...`；Linux 需加 `--userns=keep-id`，见 §2.5）。
 
@@ -305,10 +312,103 @@ stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适�
 | 换 key/换模型 | 改 `..\cadence-box.yaml` → `podman restart devbox` |
 | 中间件增删启停 | 容器内 `stack` 命令（见 §4），或直接对 agent 说「加个 kafka」「重启 mysql」 |
 | 跑项目 | 容器内 `app run myapp -- mvn spring-boot:run`（后台+日志+端口探活），或让 agent 全权 |
+| 切 JDK 版本 | 容器内 `jdk list` / `jdk use 8` / `jdk use 21`（见 §3.1；默认内置 Temurin 21，选择跨重建保留） |
 | 宿主工具连库 | Navicat 连 `127.0.0.1:3306`（root/cadence123）；浏览器开 `localhost:3000/8080` |
 | 下班 | `podman stop devbox` + `podman-compose -f compose.yaml stop`——凭据/依赖缓存/中间件数据全在卷里，不丢 |
 
 代码工作方式：宿主 IDE 照常编辑 `D:\code`（或 `~/code`）下的仓库，容器内 agent/构建实时看到同一工作树（bind 双向共享）；push 在宿主 git 客户端完成。
+
+### 3.1 JDK 版本选择（容器内 `jdk list` / `jdk use`）
+
+镜像内置 **Temurin 21**（`/usr/lib/jvm/temurin-21-jdk-amd64`）；需要跑老项目时可在容器内切到**完整的 OpenJDK 8 JDK**（`java` 与 `javac` 都是 8，不是只有运行时的 JRE）。选择保存在独立的 `cadence-jdks` 卷里，**重建容器、升级镜像都不丢**；不弹菜单、不自动识别项目、不影响宿主。
+
+```bash
+jdk list          # 列出内置/已安装版本，* 标记当前选择
+jdk use 21        # 切回镜像内置 Temurin 21
+jdk use 8         # 切到 OpenJDK 8；没装过时先按需下载安装（见 §3.1.1）
+```
+
+| 场景 | 行为 |
+|---|---|
+| 全新安装（状态卷为空） | 容器首启自动选**内置 21**；启动日志：`未发现已有 JDK 选择——初始化为镜像内置 21` |
+| 已选过版本 → 重建容器/升级镜像 | 沿用上次选择；启动日志：`已有 JDK 选择有效：主版本 …——保留` |
+| 命令一致性 | `java`/`javac`/`mvn` 等一律读固定的 `JAVA_HOME=/home/dev/.cadence/jdks/current`，`current/bin` 在 `PATH` 前部：**非交互** `podman exec devbox java -version`（不读 `.bashrc`）、交互式 shell、容器内 agent 拿到的都是同一个版本 |
+| 已运行的 JVM | **不受切换影响**（切换只原子替换 `current` 链接，不改已启动进程的 `java.home`） |
+| 切回 / 卸载 | `jdk use 21` 切回；想删掉 8：先 `jdk use 21`，再 `sudo rm -rf /home/dev/.cadence/jdks/8`（不能删当前选中的目录） |
+
+**生效边界（重要）**
+
+- 只影响**切换之后新启动**的 Java 进程。已解析并缓存过 `java` 真实路径的 shell/IDE/守护进程不会热切换；**不要在一次构建过程中切换版本**——正在跑的构建若再起 Java 子进程，可能混用两个版本。
+- `PATH` 顺序：`current/bin` → `/usr/local/bin`（兜底入口）→ `/usr/bin`。只有**绝对路径** `/usr/bin/java` 会拿到系统自带的 Temurin 21；普通 `java` 命令永远走当前选择。
+- JDK 状态损坏（`current` 悬空）或状态卷未挂载时，兜底入口**明确报错并返回 127**，不会静默回退到系统 Java（否则 `java` 报 21、`mvn` 报 JAVA_HOME 无效，同一次损坏出现两种矛盾表现）。修复：`jdk list` 看状态 → `jdk use 21`。
+
+#### 3.1.1 `jdk use 8` 首次安装：来源与校验
+
+默认按需安装的是**固定版本**（不猜 URL、不静默换源、不降级校验）：
+
+| 项 | 值 |
+|---|---|
+| 发行物 | Eclipse Temurin **完整 JDK 8**（`temurin-8-jdk`） |
+| 版本 / 架构 | `8.0.504.0.0+1-0` / `amd64`（未提供 arm64；非 amd64 上 `jdk use 8` 会明确拒绝） |
+| 默认来源 | `https://mirrors.ustc.edu.cn/adoptium/deb/pool/main/t/temurin-8/temurin-8-jdk_8.0.504.0.0+1-0_amd64.deb`（中科大 USTC 的 Adoptium 镜像） |
+| 大小 / SHA-256 | 85228180 字节 / `8747c07903772fb7fcfff803e06bd4761124def9d2aef781c98c745c10e6841a` |
+| 信任链 | 镜像内 apt 源用 Adoptium 签名密钥（UID `Adoptium GPG Key (DEB/RPM Signing Key) <temurin-dev@eclipse.org>`，指纹 `3B04 D753 C905 0D9A 5D34 3F39 843C 48A5 65F8 F04B`，与发行方 <https://adoptium.net/installation/linux/> 公布一致）校验签名源；版本与 SHA-256 取自该源的签名 `Release → Packages` 元数据，并独立下载复核 |
+| 安装步骤 | 下载 → 固定 SHA-256 校验 → 安全解包（校验 Debian 包类型、控制字段身份、成员路径不逃逸）→ 真实 `java`/`javac` 版本检查（都必须是 8）→ 同卷原子发布 → 最后原子替换 `current` |
+| 重复执行 | 已安装且校验通过的版本**不重复下载**，直接切换 |
+| 失败行为 | 下载失败 / 哈希不符 / 包身份不符 / 缺 `javac` / 版本不是 8 / 中途被中断：**一律非零退出，`current` 与已安装版本一点不动**，并清理安装临时目录（不留半个安装）；被 `SIGKILL`/断电直接杀掉时收不到信号、来不及清理，残留的 `.install.*` 由**下次 `jdk use 8` 安装前**的过期清理回收（只删超过 60 分钟未更新的目录，正在进行的安装不会误删） |
+
+实测（2026-09-23，Linux + rootless podman）：从 USTC 下载 85MB 约 9 秒；`jdk use 8` 后 `java -version` → `1.8.0_504`、`javac -version` → `1.8.0_504`、`mvn -v` → `Java version: 1.8.0_504`。
+
+#### 3.1.2 换源 / 自建镜像 / 离线导入（必须成对配置）
+
+来源与哈希**必须成对**给出；只给其一、或哈希不符都会被拒绝——不存在"只放宽校验"的开关：
+
+```bash
+# 一次性（只对本次命令生效）
+podman exec -e CADENCE_JDK8_URL=https://你的镜像/temurin-8-jdk_8.0.504.0.0+1-0_amd64.deb \
+            -e CADENCE_JDK8_SHA256=<该发行物的独立核实 SHA-256> \
+            devbox jdk use 8
+
+# 常驻：devbox 启动命令加 -e（或在 stack/compose.yaml 的 devbox.environment 下加同名两项），之后容器内直接 jdk use 8
+
+# 离线导入：deb 先放到宿主，经挂载点可达后用 file:// 指向（sha 取自你自己的导入记录）
+podman exec -e CADENCE_JDK8_URL=file:///cadence/stack/temurin-8-jdk_8.0.504.0.0+1-0_amd64.deb \
+            -e CADENCE_JDK8_SHA256=8747c07903772fb7fcfff803e06bd4761124def9d2aef781c98c745c10e6841a \
+            devbox jdk use 8
+```
+
+- 校验值必须来自**对该发行物的独立核实**（发行方签名元数据、你自建镜像的构建记录等）。不要从下载同一份文件的同一个地方同时取包和哈希——那样证明不了真实性。
+- 执行时 stderr 会同时打印**实际使用的来源**与**期望哈希**，便于核对；想让自建源成为**默认**需改 `devbox/jdk.sh` 里的清单（属实现改动，不是配置项，改前请走评审）。
+- 校验失败时按提示核对：源被换过 / 镜像站同步滞后 / 你手里的 SHA 不是这个包的——**不要为了"装上去"而改用不校验的路径**。
+
+#### 3.1.3 运行时依赖与已知风险
+
+`jdk use 8` 是**解包安装**（不跑 `apt`），因此不会自动安装 deb 声明的系统依赖；下表是内置 Temurin 21 层构建时 `apt-get install -y --no-install-recommends temurin-21-jdk` 的**实测解析结果**（不是照抄 deb 的声明）：
+
+| 依赖 | 镜像内状态 | 影响与处理 |
+|---|---|---|
+| `libasound2` | **已预装**（由 `liboss4-salsa-asound2` 满足，提供 `libasound.so.2`） | Temurin 21 的硬依赖，构建时 apt 已自动装入一个有 `Provides: libasound2` 的包：`/usr/lib/x86_64-linux-gnu/libasound.so.2 → liboss4-salsa.so.2.0.0`——是 OSS4 兼容层而非真 ALSA（容器内无音频设备，两者等价）。`java -version`/`javac`/Maven 构建均正常。想换成真 ALSA 库：`sudo apt-get install -y libasound2t64`（noble 里 `libasound2` 只是**虚拟包名**，照旧名安装会 `E: Package 'libasound2' has no installation candidate`）；**该改动不跨重建保留**，要持久请改 `devbox/Dockerfile` |
+| 字体 `fonts-dejavu-core`、`fonts-dejavu-mono` | 已预装 | 来源不是 `Recommends`（Dockerfile 用了 `--no-install-recommends`），而是 `libfontconfig1 → fontconfig-config` 的 Depends 备选组选中 `fonts-dejavu-core` 并连带 `fonts-dejavu-mono`。headless 出图/出 PDF（JasperReports、POI 等）的拉丁/希腊/西里尔字形够用；**不含中日韩字形**（中文报表会出方框），中文请另装 `sudo apt-get install -y fonts-noto-cjk`，只需更多拉丁字形则装 `fonts-dejavu-extra` |
+| `fontconfig`（`fc-list`/`fc-cache` 命令） | **未预装** | 镜像里只有运行库 `libfontconfig1` 与配置包 `fontconfig-config`，命令包 `fontconfig` 没装（`fc-list` 不可用）。需要时 `sudo apt-get install -y fontconfig`；**该改动不跨重建保留**，要持久请改 `devbox/Dockerfile` |
+| `adoptium-ca-certificates`、`java-common` | 已预装 | 无需处理 |
+
+- TLS 信任根由 JDK 自带 `cacerts` 提供，不依赖系统 CA 路径。
+- 许可：Temurin 为 GPLv2 + Classpath Exception（Adoptium 发行条款）；对外分发前请走贵司合规确认。
+
+#### 3.1.4 报错速查
+
+| 报错 | 原因 | 处理 |
+|---|---|---|
+| `不支持的主版本 11（当前可用：21）` | 清单外的主版本（只支持内置 21 与按需的 8） | 用 `jdk use 8` / `jdk use 21`（退出码 3） |
+| `CADENCE_JDK8_URL 与 CADENCE_JDK8_SHA256 必须成对配置` | 只配了其中一个 | 两个一起给（§3.1.2） |
+| `下载失败：…` | 源不可达/被代理拦/离线 | 换可达镜像或离线 `file://`（§3.1.2）；当前选择不受影响 |
+| `SHA-256 校验失败：期望 … 实际 …` | 源上的包与你手里的哈希不一致 | 核对来源与哈希，别绕过校验 |
+| `JDK 状态损坏：… 未自动重置` | 状态卷里的 `current` 指向不存在/不可用的目录 | `jdk list` 确认 → `jdk use 21` 修复（不会自动重置你的选择） |
+| `JDK 状态目录 … 不存在（状态卷未挂载？）` | 启动命令漏了 `-v cadence-jdks:/home/dev/.cadence/jdks` | 按 §2.4 补挂载后重建容器 |
+| `JDK 状态目录 … 不可写（卷属主不是当前用户？）` | 卷属主不是 `dev`（如手工 `mkdir` 成 root） | 重建该卷（`podman volume rm cadence-jdks` 后按 §2.2 第 4 步重来；会丢已装 JDK） |
+| `java: JDK 状态不可用：… 已阻止回退到系统 Java` | 兜底入口生效（状态损坏/卷未挂载） | 同上：`jdk use 21`；这是**刻意失败**，不是 bug |
+
+**验证状态**：`jdk list`、`jdk use 8`（真实下载+校验）、`jdk use 21`、跨重建沿用、失败安全（下载/哈希/不支持版本）、非交互与交互命令一致性、no-sock 挂载拓扑，均已在 **Linux + rootless podman** 实机跑通（2026-09-23，本地构建镜像）。**未验证**：Windows Podman Desktop 上的同一流程（安装器与卷挂载只做了静态核对，见 §8）、Gradle（镜像不含 `gradle` CLI，项目自带 `gradlew` 的 JVM 由其读 `JAVA_HOME` 决定）、arm64。
 
 ## 4. 中间件管理（容器内 `stack` 命令）
 
@@ -430,7 +530,19 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 
 **skills 更新（自动）**：每次容器启动 entrypoint 自动执行 `install.sh update`（幂等；失败仅告警不阻断，下次启动重试）。
 
-**数据与回滚**：16 个数据卷独立于镜像，更新镜像不动数据；回滚=把 `.env` 的镜像 tag 改回上一周版重建 devbox。缓存膨胀时 `podman system prune`（不会碰 external 卷）。
+**升级到含 JDK 选择特性的版本（一期镜像 → 本期）**
+
+1. 拉取新镜像（见上）
+2. **补建 `cadence-jdks` 卷**：external 卷 compose 不会自建，缺它启动直接报错——重跑 `install.ps1`（幂等）或手工 `podman volume create cadence-jdks`
+3. 按启动命令重建 devbox；进容器 `jdk list` 应显示 `21 内置`，需要 8 就 `jdk use 8`
+
+> 补建卷不动任何旧数据（一期安装无此卷）；新卷首启前 `jdk list` 显示「当前选择：未设置（下次启动初始化为内置 21）」属正常。
+
+**数据与回滚**：17 个数据卷独立于镜像，更新镜像不动数据；回滚=把 `.env` 的镜像 tag 改回上一周版重建 devbox。缓存膨胀时 `podman system prune`（不会碰 external 卷）。
+
+- **回滚不删卷**：JDK 状态卷（已安装的 8 + `current` 选择）留在原处；旧镜像不认识 `jdk` 命令、只继续用内置 21，不会破坏卷内容——再升回新镜像时选择仍在。
+- 内置 21 的目录若随镜像升级改名，entrypoint 会识别并**迁移指向内置 21 的选择**；额外安装的 8 不受影响。
+- 卸载该特性：`podman volume rm cadence-jdks`（会一并删掉已安装的 8；容器正在用时先 `podman rm -f devbox`）。
 
 ## 7. FAQ
 
@@ -440,6 +552,10 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 4. **dev server 收不到宿主侧文件改动**：镜像已默认 `CHOKIDAR_USEPOLLING=1`（vite）；spring-boot-devtools 需在配置中开启轮询：`spring.devtools.restart.poll-interval=1s` + `quiet-period=0.8s`
 5. **Windows 上 `podman pull` 报 `…registries.conf.d\999-…conf: The file cannot be accessed by the system`**：Podman Desktop 生成的该文件系统层不可读，会卡死一切镜像拉取——install.ps1 第 3 步已自动改名 `.unreadable.bak` 绕过；手工安装则手动删除该文件
 6. **podman-compose 报 `unknown mount option /workspace`**：短语法挂载按 `:` 切分，Windows 盘符路径（`D:/code:/workspace`）被切成三段——compose.yaml 的 workspace 挂载已用长语法 `type: bind` 规避，旧安装目录请删除 `stack\compose.yaml` 重跑 install.ps1 重新生成
+7. **容器内没有 `jdk` 命令**：镜像是旧版（不含 JDK 选择特性），换新版镜像并按 §6 补建 `cadence-jdks` 卷
+8. **`jdk use 8` 后重建容器又变回 21**：启动命令漏了 `-v cadence-jdks:/home/dev/.cadence/jdks`（§2.4）——状态只存在该卷里，没挂卷就只是容器内临时状态
+9. **关掉运维通道（no-sock）后 JDK 还能用吗**：能。sock 与 JDK 无关；`stack/docker-compose.no-sock.yml` 已保留 `cadence-jdks` 挂载，`jdk list`/`jdk use` 照常工作（该文件用 compose 的 `!override` 语法，需 compose 实现支持该标签；本机 `podman-compose` 版本解析该标签会报 `RepresenterError`，故未在本机实跑该文件，其挂载集合已按等价 `podman run` 逐个挂载实测通过）
+10. **`jdk` 相关报错怎么查**：见 §3.1.4 报错速查表（不支持版本 / 来源与哈希未成对 / 下载失败 / 哈希不符 / 状态损坏 / 卷未挂载 / 卷不可写 / 兜底入口拒绝回退）
 
 ## 8. Windows 真机验收（已执行：2026-09-21，维护者 michaelChe）
 
@@ -477,6 +593,8 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 > **留证情况**：本次真机的机型、Podman/镜像版本、网络环境、各项实测数值与录屏/截图**未留存**（维护者确认结果通过，细节数据未归档）。
 > 因此本清单只记录结论，不记录数值；后续需要数值证据时按 §8.1 重新执行并留证。
 > 第 3 项的时间门与第 4 项的 5 秒热更为设计「七、验证口径」的验收门槛，本次按维护者确认为通过。
+>
+> **范围说明**：上表是**一期**验收（2026-09-21），当时镜像尚无 §3.1 的 JDK 选择特性；该特性在 Windows 上**尚未真机验证**——`install.ps1` 的 `cadence-jdks` 预建与 `podman run -v` 挂载只做过静态核对，Windows 端口只到「静态断言通过」，不构成真机 E2E 结论。
 
 ## 9. 镜像构建信息
 

@@ -12,6 +12,7 @@ volumes:
   cadence-kimi: { external: true }
   cadence-agents: { external: true }
   cadence-omp: { external: true }
+  cadence-jdks: { external: true }   # JDK 状态：额外安装的 JDK + current 选择（供 jdk use 跨重建沿用）
   # 缓存卷
   cadence-m2: { external: true }
   cadence-npm: { external: true }
@@ -53,6 +54,7 @@ services:
       - cadence-uv:/home/dev/.cache/uv
       - cadence-pip:/home/dev/.cache/pip
       - cadence-gradle:/home/dev/.gradle
+      - cadence-jdks:/home/dev/.cadence/jdks
     ports:
       - "127.0.0.1:3000:3000"
       - "127.0.0.1:8080:8080"

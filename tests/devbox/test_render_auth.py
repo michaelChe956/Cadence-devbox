@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """render-auth.py 单测：合法配置五端目标文件断言 / 校验错误文案 / 原子性 / pi 剔 packages / kimi 5 文件 / git 身份。"""
+import errno
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -191,6 +193,83 @@ def test_render_atomicity(tmp_path, monkeypatch):
     mod.render_all(cfg, home)
     assert (home / ".claude/settings.json").exists() # 成功路径：完整替换
     assert sentinel.read_text() != "旧内容"
+
+
+# ---------- 目标目录是独立挂载点（named volume）时的发布 ----------
+
+def _mount_guarded_replace(mod, monkeypatch, home, staging_name=".cadence-render-tmp"):
+    """把 os.replace 换成本内核语义的守门版：暂存目录子树与其余路径视为不同设备。
+
+    真实拓扑：暂存目录在容器 rootfs（overlay），而 `$HOME/.claude`、`$HOME/.codex` 等是 podman
+    named volume 的挂载点——跨设备 rename(2) 必然返回 EXDEV，任何"暂存目录 → 目标"的单纯
+    rename 都会失败。这里用设备归属模拟该内核规则，让缺陷在无特权测试里可复现。
+    """
+    staging = (home / staging_name).resolve()
+    real = os.replace
+
+    def device(path):
+        resolved = Path(path).resolve()
+        return "staging" if resolved == staging or staging in resolved.parents else "home"
+
+    def guarded(src, dst, *args, **kwargs):
+        if device(src) != device(dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src), str(dst))
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(mod.os, "replace", guarded)
+    return guarded
+
+
+def _publish_leftovers(home, mod):
+    """目标目录里残留的发布临时文件（暂存目录本身不算）。"""
+    staged = home / mod.RENDER_TMP_DIRNAME
+    return [p for p in home.rglob(".cadence-render*")
+            if p != staged and staged not in p.parents]
+
+
+def test_render_publishes_across_mount_boundary(tmp_path, monkeypatch):
+    """回归：目标目录是独立挂载点时必须仍能完成渲染（此前会 EXDEV → entrypoint 退出 2，容器拒启）。"""
+    mod = _load_module()
+    home = tmp_path / "home"
+    _mount_guarded_replace(mod, monkeypatch, home)
+    mod.render_all(_cfg(tmp_path), home)
+
+    assert json.loads((home / ".claude/settings.json").read_text())["env"]["ANTHROPIC_AUTH_TOKEN"] \
+        == "sk-live-secret-do-not-print"
+    assert (home / ".claude/.credentials.json").exists()
+    assert (home / ".codex/config.toml").exists()
+    assert (home / ".kimi-code/region").exists()
+    assert "autocrlf = true" in (home / ".gitconfig").read_text()
+    assert _publish_leftovers(home, mod) == [], "发布完成后不得在目标目录残留临时文件"
+
+
+def test_render_failed_publish_leaves_no_residue_and_stays_retryable(tmp_path, monkeypatch):
+    """发布阶段失败：不残留临时文件、不毁坏既有目标，且重跑即可完成。"""
+    mod = _load_module()
+    home = tmp_path / "home"
+    cfg = _cfg(tmp_path)
+    guard = _mount_guarded_replace(mod, monkeypatch, home)
+    sentinel = home / ".gitconfig"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("旧内容", encoding="utf-8")
+    calls = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(errno.EIO, "模拟发布中断")
+        return guard(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(mod.os, "replace", flaky)
+    with pytest.raises(OSError):
+        mod.render_all(cfg, home)
+    assert calls["n"] >= 2
+    assert _publish_leftovers(home, mod) == [], "发布失败后不得在目标目录残留临时文件"
+
+    monkeypatch.setattr(mod.os, "replace", guard)
+    mod.render_all(cfg, home)
+    assert "autocrlf = true" in sentinel.read_text()
+    assert _publish_leftovers(home, mod) == []
 
 
 # ---------- CLI ----------

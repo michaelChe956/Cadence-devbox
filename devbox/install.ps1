@@ -1,6 +1,6 @@
 ﻿# cadence devbox Windows 首次安装脚本（podman 路线，对齐 devbox/README.md §2.1–2.4；设计 4.6：≤5 步）
 # 自动完成：1.检测 podman/machine → 2.建安装目录+拷文件+生成密钥模板 → 3.配置国内镜像加速
-#           → 4.建 16 数据卷+拉镜像(默认阿里云 ACR 直拉)+起中间件与 devbox → 5.打印后续提示
+#           → 4.建 17 数据卷+拉镜像(默认阿里云 ACR 直拉)+起中间件与 devbox → 5.打印后续提示
 # 用法（在仓库根目录——devbox 文件夹的上一层——打开 PowerShell；任意目录则 -File 用绝对路径）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 param(
@@ -143,7 +143,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 # ---- 第 4 步：预创建 external 卷 + 拉镜像 + 起中间件与 devbox（README §2.2/2.4） ----
 Info '第 4/5 步：创建数据卷并启动'
-$vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-agents','cadence-omp',
+$vols = @('cadence-claude','cadence-codex','cadence-pi','cadence-kimi','cadence-agents','cadence-omp','cadence-jdks',
           'cadence-m2','cadence-npm','cadence-npm-global','cadence-uv','cadence-pip','cadence-gradle',
           'cadence-mysql-data','cadence-redis-data','cadence-rabbitmq-data','cadence-minio-data')
 foreach ($v in $vols) { if (-not (Probe "podman volume exists $v")) { podman volume create $v | Out-Null } }
@@ -174,6 +174,7 @@ podman run -d --name devbox --network cadence_default `
   -v "$InstallDir\stack:/cadence/stack" `
   -v "${Workspace}:/workspace" `
   -v /var/run/podman/podman.sock:/var/run/docker.sock `
+  -v cadence-jdks:/home/dev/.cadence/jdks `
   -p 127.0.0.1:3000:3000 -p 127.0.0.1:8080:8080 `
   $Image
 if ($LASTEXITCODE -ne 0) { Die 'devbox 启动失败：请把上方错误反馈维护者' }

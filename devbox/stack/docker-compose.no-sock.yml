@@ -21,3 +21,4 @@ services:
       - cadence-uv:/home/dev/.cache/uv
       - cadence-pip:/home/dev/.cache/pip
       - cadence-gradle:/home/dev/.gradle
+      - cadence-jdks:/home/dev/.cadence/jdks

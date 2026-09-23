@@ -52,6 +52,13 @@ RUN install -d -m 0755 /etc/apt/keyrings \
            "/usr/lib/jvm/temurin-${JDK_VERSION}-jdk-amd64/lib/src.zip" \
            "/usr/lib/jvm/temurin-${JDK_VERSION}-jdk-amd64/man" \
  && rm -rf /var/lib/apt/lists/*
+# JDK 选择入口：JAVA_HOME 固定指向状态卷内 current（不写 .bashrc——直接 exec 不读初始化文件）；
+# current/bin 排在 PATH 前部，mvn/gradle 经 JAVA_HOME 解析到同一 JDK（设计《OpenJDK 8 按需安装与持久切换》）
+ENV JAVA_HOME=/home/dev/.cadence/jdks/current \
+    CADENCE_JDK_ROOT=/home/dev/.cadence/jdks \
+    CADENCE_BUILTIN_JDK_DIR=/usr/lib/jvm/temurin-${JDK_VERSION}-jdk-amd64 \
+    CADENCE_BUILTIN_JDK_MAJOR=${JDK_VERSION} \
+    PATH=/home/dev/.cadence/jdks/current/bin:${PATH}
 # Maven：aliyun tarball（2026-09-11 实测：USTC/TUNA 对容器 TLS 指纹 GET 误杀 403；aliyun/腾讯 200）
 RUN curl -fsSL "https://mirrors.aliyun.com/apache/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz \
  && tar -xzf /tmp/maven.tgz -C /opt \
@@ -104,6 +111,8 @@ COPY --chmod=0755 render-auth.py /usr/local/lib/cadence/render-auth.py
 COPY --chmod=0755 stack/stack-lib.sh /usr/local/lib/cadence/stack-lib.sh
 COPY --chmod=0755 stack/stack.sh /usr/local/bin/stack
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/cadence-entrypoint
+COPY --chmod=0755 jdk.sh /usr/local/bin/jdk
+COPY --chmod=0755 jdk-shim.sh /usr/local/lib/cadence/jdk-shim.sh
 COPY compose.yaml /opt/cadence/stack/compose.yaml
 COPY stack/docker-compose.no-sock.yml /opt/cadence/stack/docker-compose.no-sock.yml
 COPY stack/catalog/ /opt/cadence/stack/catalog/
@@ -111,6 +120,21 @@ RUN printf 'jdk=temurin-%s\nmaven=%s\nnode=%s\nuv=%s\npyyaml=%s\nclaude-code=%s\
       "$JDK_VERSION" "$MAVEN_VERSION" "$NODE_VERSION" "$UV_VERSION" "$PYYAML_VERSION" \
       "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$PI_VERSION" "$OMP_VERSION" "$BUN_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       > /opt/cadence/versions.txt
+# JDK 状态卷挂载点：镜像内预建且属 dev——命名卷首挂继承镜像内属主，否则 dev 无法写入状态。
+# install -d 只把 -o/-g 施加到每个路径的最后一级，故父目录 /home/dev/.cadence 必须一并列出：否则它以
+# root 拥有，entrypoint 建 ~/.cadence/logs 会 Permission denied 而整段启动中断（2026-09-23 真机实测）。
+RUN install -d -m 0755 -o dev -g dev /home/dev/.cadence /home/dev/.cadence/jdks
+# JDK 工具兜底入口：工具名取自内置 JDK 自身 bin（JDK 版本变更自动同步）；/usr/local/bin 先于 /usr/bin，
+# 状态损坏时在此明确失败，绝不落回 /usr/bin 的系统 Java（见 jdk-shim.sh 注释）。
+RUN for tool in "$CADENCE_BUILTIN_JDK_DIR"/bin/*; do \
+      name="$(basename "$tool")"; \
+      if [ -e "/usr/local/bin/$name" ] || [ -L "/usr/local/bin/$name" ]; then \
+        printf '警告：/usr/local/bin/%s 已存在，跳过 JDK 兜底入口\n' "$name" >&2; continue; \
+      fi; \
+      ln -s /usr/local/lib/cadence/jdk-shim.sh "/usr/local/bin/$name"; \
+    done \
+ && test -L /usr/local/bin/java && test -L /usr/local/bin/javac \
+ && test -x /usr/local/bin/java
 USER dev
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/cadence-entrypoint"]
