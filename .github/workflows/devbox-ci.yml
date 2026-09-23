@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   checks:
-    name: pytest（46 项）与 ShellCheck
+    name: pytest（tests/devbox 全量）与 ShellCheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,8 +22,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes shellcheck
 
-      - name: pytest（渲染器 / stack CLI / compose 结构 / entrypoint）
+      - name: pytest（渲染器 / stack CLI / compose 结构 / entrypoint / JDK 选择 / 安装文档一致性）
         run: uv run --with pytest --with pyyaml python -m pytest tests/devbox/ -v
 
       - name: ShellCheck（devbox 脚本）
-        run: shellcheck --shell=bash --severity=warning devbox/entrypoint.sh devbox/stack/stack.sh devbox/stack/stack-lib.sh
+        run: shellcheck --shell=bash --severity=warning devbox/entrypoint.sh devbox/stack/stack.sh devbox/stack/stack-lib.sh devbox/jdk.sh devbox/jdk-shim.sh

@@ -3,7 +3,8 @@
 """cadence-box.yaml → 五端 CLI 认证/模型配置渲染器。
 
 事实基线：eval/docker/container.py::_copy_auth（夜测五端「能用」最小集，2026-09-11 本机结构实证）。
-仅依赖 stdlib + PyYAML。渲染采用「临时目录全量渲染后逐文件 os.replace 原子替换」。
+仅依赖 stdlib + PyYAML。渲染采用「临时目录全量渲染后逐文件安全发布」，发布既保证同挂载点内原子替换，
+也兼容目标目录本身是独立挂载点（容器内 $HOME/.claude 等为 named volume）的跨设备场景。
 """
 from __future__ import annotations
 
@@ -12,7 +13,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -23,6 +26,7 @@ MODEL_REQUIRED = ("claude", "codex", "omp")     # pi/kimi 可省略 model，默�
 DEFAULT_API = "openai-completions"              # providers.<id>.api 缺省（pi/omp）；claude 侧透传 base_url
 DEFAULT_WIRE_API = "responses"                  # providers.<id>.wire_api 缺省（codex）
 RENDER_TMP_DIRNAME = ".cadence-render-tmp"
+PUBLISH_TMP_PREFIX = ".cadence-render-publish-"
 LINES_KEY = "__lines__"
 
 
@@ -387,6 +391,33 @@ def _build_targets(cfg) -> dict:
 
 # ---------------- 渲染主流程 ----------------
 
+def _publish(src: Path, final: Path) -> None:
+    """把暂存文件安全落位到 final；同挂载点内替换原子，目标目录是独立挂载点时也能完成。
+
+    为什么不能直接 os.replace(src, final)：final 的父目录可能是容器内挂载的 named volume
+    （$HOME/.claude、$HOME/.codex 等），与暂存目录（$HOME/.cadence-render-tmp，容器 rootfs）
+    不在同一设备，跨设备 rename(2) 必然返回 EXDEV，导致渲染中断、容器拒启。
+    做法：先在 final 所在目录建临时文件（与 final 同挂载点），写完 fsync 后 rename —— 目标路径上
+    要么是旧内容、要么是完整新内容，不会出现半截文件；跨设备只多一次显式拷贝，不影响替换原子性。
+    """
+    final.parent.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(prefix=PUBLISH_TMP_PREFIX, dir=str(final.parent))
+    staged = Path(staged_name)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            shutil.copyfileobj(inp, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(staged, stat.S_IMODE(src.stat().st_mode))   # 与直接改写目标文件一致的权限
+        os.replace(staged, final)
+    except BaseException:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def render_all(cfg: dict, home) -> None:
     errs = validate(cfg)
     if errs:
@@ -402,11 +433,9 @@ def render_all(cfg: dict, home) -> None:
         dst = tmp_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(_serialize(fmt, payload), encoding="utf-8")
-    # 阶段二：逐文件原子替换（os.replace 同文件系统内原子）
+    # 阶段二：逐文件安全发布（同挂载点内原子替换；目标目录可能是独立挂载点，见 _publish）
     for rel in targets:
-        final = home / rel
-        final.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(tmp_root / rel, final)
+        _publish(tmp_root / rel, home / rel)
     shutil.rmtree(tmp_root)
 
 

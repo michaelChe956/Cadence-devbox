@@ -66,6 +66,7 @@ def test_image_pins_and_devbox_mounts():
         "cadence-m2:/home/dev/.m2", "cadence-npm:/home/dev/.npm",
         "cadence-npm-global:/home/dev/.npm-global", "cadence-uv:/home/dev/.cache/uv",
         "cadence-pip:/home/dev/.cache/pip", "cadence-gradle:/home/dev/.gradle",
+        "cadence-jdks:/home/dev/.cadence/jdks",
     ):
         assert mount in volumes, f"devbox 缺挂载 {mount}"
     for service in MW:
@@ -98,3 +99,4 @@ def test_no_sock_override_replaces_volumes_without_socket():
     assert "!override" in text
     assert "type: bind" in text and "target: /workspace" in text, "no-sock 的 workspace 挂载须同为长语法（Windows 盘符兼容）"
     assert "cadence-claude:/home/dev/.claude" in text
+    assert "cadence-jdks:/home/dev/.cadence/jdks" in text, "no-sock 覆盖须同样挂载 JDK 状态卷"
