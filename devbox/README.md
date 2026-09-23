@@ -408,7 +408,15 @@ podman exec -e CADENCE_JDK8_URL=file:///cadence/stack/temurin-8-jdk_8.0.504.0.0+
 | `JDK 状态目录 … 不可写（卷属主不是当前用户？）` | 卷属主不是 `dev`（如手工 `mkdir` 成 root） | 重建该卷（`podman volume rm cadence-jdks` 后按 §2.2 第 4 步重来；会丢已装 JDK） |
 | `java: JDK 状态不可用：… 已阻止回退到系统 Java` | 兜底入口生效（状态损坏/卷未挂载） | 同上：`jdk use 21`；这是**刻意失败**，不是 bug |
 
-**验证状态**：`jdk list`、`jdk use 8`（真实下载+校验）、`jdk use 21`、跨重建沿用、失败安全（下载/哈希/不支持版本）、非交互与交互命令一致性、no-sock 挂载拓扑，均已在 **Linux + rootless podman** 实机跑通（2026-09-23，本地构建镜像）。**未验证**：Windows Podman Desktop 上的同一流程（安装器与卷挂载只做了静态核对，见 §8）、Gradle（镜像不含 `gradle` CLI，项目自带 `gradlew` 的 JVM 由其读 `JAVA_HOME` 决定）、arm64。
+**验证状态**：以下场景已在 **Linux + rootless Podman** 本地真实容器中完成（2026-09-23，基于本地构建镜像）：
+
+- 空 `cadence-jdks` 卷首次启动 → 默认 Temurin 21；`jdk list` 正确标记当前版本。
+- `jdk use 8` → 从 USTC 真实下载并校验 85MB 包；`java -version` 与 `javac -version` 均为 `1.8.0_504`，`mvn -v` 使用 `Java version: 1.8.0_504`。
+- 删除并重建容器 → 仍使用 8，且已安装包不重复下载；`jdk use 21` 后再次重建 → 仍使用 21。
+- 错误 URL、错误 SHA-256、来源不可达、不支持版本、安装中断 → 命令失败且原 `current` 选择不变；损坏状态下 `java`/`javac` 不回退到系统 Java。
+- 交互 shell、`podman exec` 非交互命令、Maven，以及 no-sock 等价逐卷挂载拓扑均已验证；本机 `podman-compose` 无法解析 `!override`，因此未直接执行 no-sock Compose 文件。
+
+**未验证**：Windows Podman Desktop 上的同一 JDK 流程（安装器与卷挂载只做静态核对，见 §8）、Gradle CLI（镜像不含 `gradle` CLI，项目自带 `gradlew` 的 JVM 由其读 `JAVA_HOME` 决定）、arm64、macOS。
 
 ## 4. 中间件管理（容器内 `stack` 命令）
 
