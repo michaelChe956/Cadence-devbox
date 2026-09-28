@@ -7,6 +7,7 @@ current 原子切换、jdk list / jdk use；以及 jdk use 8 的按需下载（�
 import hashlib
 import io
 import os
+import re
 import subprocess
 import tarfile
 import time
@@ -624,7 +625,9 @@ def test_image_pins_stable_java_home_and_jdk_command():
     # 空卷首挂继承镜像内属主：目录必须镜像内预建且属 dev，否则 dev 无法写入状态。
     # install -d 只把 -o/-g 施加到每个路径的最后一级，故父目录 /home/dev/.cadence 必须一并列出——
     # 否则它以 root 拥有，entrypoint 建 ~/.cadence/logs 会 Permission denied（2026-09-23 真机实测）。
-    assert "install -d -m 0755 -o dev -g dev /home/dev/.cadence /home/dev/.cadence/jdks" in text
+    logical = re.sub(r"\\\n\s*", " ", text)  # 合并续行：挂载点清单已扩展为多行（全部命名卷挂载点预建 dev 属主）
+    assert "install -d -m 0755 -o dev -g dev" in logical and "/home/dev/.cadence /home/dev/.cadence/jdks" in logical, \
+        "JDK 状态卷挂载点必须镜像内预建且属 dev"
 
 
 def test_image_installs_fail_closed_jdk_tool_shims():

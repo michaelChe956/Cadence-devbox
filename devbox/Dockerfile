@@ -120,10 +120,15 @@ RUN printf 'jdk=temurin-%s\nmaven=%s\nnode=%s\nuv=%s\npyyaml=%s\nclaude-code=%s\
       "$JDK_VERSION" "$MAVEN_VERSION" "$NODE_VERSION" "$UV_VERSION" "$PYYAML_VERSION" \
       "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$PI_VERSION" "$OMP_VERSION" "$BUN_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       > /opt/cadence/versions.txt
-# JDK 状态卷挂载点：镜像内预建且属 dev——命名卷首挂继承镜像内属主，否则 dev 无法写入状态。
-# install -d 只把 -o/-g 施加到每个路径的最后一级，故父目录 /home/dev/.cadence 必须一并列出：否则它以
-# root 拥有，entrypoint 建 ~/.cadence/logs 会 Permission denied 而整段启动中断（2026-09-23 真机实测）。
-RUN install -d -m 0755 -o dev -g dev /home/dev/.cadence /home/dev/.cadence/jdks
+# 命名卷挂载点：镜像内预建且属 dev——podman 首挂空卷时卷根继承镜像内目录属主；目录缺失则由 runtime 以 root 建点，
+# dev(1000) 无写权限（jdks：2026-09-23 真机实测；扩展到全部挂载点：2026-09-28 Windows 实测 8 卷 root 属主→entrypoint PermissionError 拒启）。
+# install -d 只把 -o/-g 施加到每个路径的最后一级，故父目录必须逐级显式列出。
+RUN install -d -m 0755 -o dev -g dev \
+      /home/dev/.cadence /home/dev/.cadence/jdks \
+      /home/dev/.claude /home/dev/.codex /home/dev/.agents /home/dev/.omp \
+      /home/dev/.pi /home/dev/.pi/agent /home/dev/.kimi-code \
+      /home/dev/.m2 /home/dev/.npm /home/dev/.npm-global /home/dev/.gradle \
+      /home/dev/.cache /home/dev/.cache/uv /home/dev/.cache/pip
 # JDK 工具兜底入口：工具名取自内置 JDK 自身 bin（JDK 版本变更自动同步）；/usr/local/bin 先于 /usr/bin，
 # 状态损坏时在此明确失败，绝不落回 /usr/bin 的系统 Java（见 jdk-shim.sh 注释）。
 RUN for tool in "$CADENCE_BUILTIN_JDK_DIR"/bin/*; do \

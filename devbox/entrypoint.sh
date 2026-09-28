@@ -3,7 +3,7 @@
 #   1) JDK 持久状态初始化/校验（空卷→内置版本；已有选择校验后保留；损坏→明确报错且不重置）
 #   2) git 对齐默认 + 轮询 env + 卷内依赖源配置刷新
 #   3) render-auth 渲染鉴权（失败即拒启 exit 2）
-#   4) stack 模板同步（/opt/cadence/stack ↔ $CADENCE_STACK_DIR；CHANGES.md 存在=用户改过→保留）
+#   4) stack 模板同步（/opt/cadence/stack ↔ $CADENCE_STACK_DIR；CHANGES.md 存在=用户改过→保留；否则分叉文件先备份再覆盖）
 #   5) skills 首启安装/幂等更新（软失败：日志落盘+下次启动重试）
 #   6) exec "$@"
 set -euo pipefail
@@ -75,7 +75,7 @@ EOF
 # ---------- 步骤 3：渲染鉴权（失败即拒启） ----------
 log "步骤 3/5：渲染鉴权配置（cadence-box.yaml → 五端）"
 if ! python3 "$CADENCE_RENDER_AUTH" --config "$CADENCE_AUTH_FILE" --home "$HOME_DIR"; then
-  log "鉴权渲染失败（缺字段/格式错，明细见上方 render-auth 输出）——拒绝启动；请修正宿主侧 cadence-box.yaml 后重启容器"
+  log "鉴权渲染失败——明细见上方 render-auth 输出：多为 cadence-box.yaml 缺字段/格式错；若是渲染脚本/环境异常，请把 entrypoint 日志反馈维护者。修正后重启容器"
   exit 2
 fi
 
@@ -85,9 +85,17 @@ if [ -f "$CADENCE_STACK_DIR/CHANGES.md" ]; then
   log "检测到 CHANGES.md（用户/agent 已改动）：保留当前 $CADENCE_STACK_DIR，不自动覆盖；新版模板差异请人工比对 /opt/cadence/stack"
 else
   mkdir -p "$CADENCE_STACK_DIR"
-  cp -a "$CADENCE_STACK_TEMPLATE_DIR/catalog" "$CADENCE_STACK_DIR/"
-  cp -f "$CADENCE_STACK_TEMPLATE_DIR/compose.yaml" "$CADENCE_STACK_DIR/compose.yaml"
-  cp -f "$CADENCE_STACK_TEMPLATE_DIR/docker-compose.no-sock.yml" "$CADENCE_STACK_DIR/docker-compose.no-sock.yml"
+  # 覆盖前把与模板分叉的本地文件备份为 <名>.bak-<时间戳>：无 CHANGES.md 的手工改动不得静默丢失
+  # （2026-09-28 Windows 实测：手工挂载行被模板同步抹掉 2 次）；模板没有的本地文件原样保留（合并语义）。
+  while IFS= read -r f; do
+    dst="$CADENCE_STACK_DIR/$f"
+    if [ -f "$dst" ] && ! cmp -s "$CADENCE_STACK_TEMPLATE_DIR/$f" "$dst"; then
+      cp -a "$dst" "$dst.bak-$(date +%Y%m%d%H%M%S)"
+      log "警告：$f 与官方模板分叉，已留 .bak- 备份后覆盖——长期保留本地版请在 stack 目录创建 CHANGES.md"
+    fi
+    mkdir -p "$(dirname "$dst")"
+    cp -f "$CADENCE_STACK_TEMPLATE_DIR/$f" "$dst"
+  done < <(cd "$CADENCE_STACK_TEMPLATE_DIR" && find compose.yaml docker-compose.no-sock.yml catalog -type f)
   log "stack 模板已同步为镜像内置版本（.env 与 CHANGES.md 不在同步范围）"
 fi
 

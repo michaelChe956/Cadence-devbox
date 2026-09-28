@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """devbox/compose.yaml 与 stack/catalog 的结构化契约校验。"""
+import re
 from pathlib import Path
 
 import yaml
@@ -100,3 +101,19 @@ def test_no_sock_override_replaces_volumes_without_socket():
     assert "type: bind" in text and "target: /workspace" in text, "no-sock 的 workspace 挂载须同为长语法（Windows 盘符兼容）"
     assert "cadence-claude:/home/dev/.claude" in text
     assert "cadence-jdks:/home/dev/.cadence/jdks" in text, "no-sock 覆盖须同样挂载 JDK 状态卷"
+
+
+def test_devbox_volume_mountpoints_precreated_in_image_as_dev():
+    """回归：devbox 命名卷的每个挂载点都必须在 Dockerfile 预建且属 dev——
+    podman 首挂空卷时卷根继承镜像内目录属主；目录缺失则由 runtime 以 root 建点，dev(1000) 无写权限
+    （2026-09-28 Windows 实测 8 个卷 root 属主 → entrypoint 渲染/回填 PermissionError 拒启）。"""
+    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    targets = [item.split(":", 1)[1] for item in doc["services"]["devbox"]["volumes"]
+               if isinstance(item, str) and item.startswith("cadence-")]
+    assert targets, "devbox 服务应挂命名卷"
+    text = (REPO / "devbox" / "Dockerfile").read_text(encoding="utf-8")
+    logical = re.sub(r"\\\n\s*", " ", text)  # 合并 Dockerfile 续行后再取 install -d 行
+    install_line = next(l for l in logical.splitlines()
+                        if not l.lstrip().startswith("#") and "install -d" in l and "/home/dev/.cadence" in l)
+    for target in targets:
+        assert target in install_line, f"挂载点 {target} 未在 Dockerfile 预建为 dev 属主"

@@ -121,6 +121,28 @@ def test_stack_sync_preserves_user_version(tmp_path):
     assert (stack / "compose.yaml").read_text() == "# 用户改过版\n"   # CHANGES.md 存在→不覆盖
     assert "保留" in r.stderr or "保留" in (home / ".cadence/logs/entrypoint.log").read_text()
 
+def test_stack_sync_backs_up_diverged_local_files(tmp_path):
+    """回归：无 CHANGES.md 时，与模板分叉的本地文件先备份为 *.bak-<时间戳> 再覆盖——
+    手工改动不得静默丢失（2026-09-28 Windows 实测 compose.yaml 手工挂载行被模板同步抹掉 2 次）。"""
+    home, stack, auth = _make(tmp_path)
+    (stack / "compose.yaml").write_text("# 我手工改过\n", encoding="utf-8")
+    (stack / "catalog/mysql").mkdir(parents=True)
+    (stack / "catalog/mysql/profile").write_text("mq\n", encoding="utf-8")            # 与模板分叉→备份后覆盖
+    (stack / "catalog/mysql/conf").mkdir(parents=True)
+    (stack / "catalog/mysql/conf/my.cnf").write_text("# 我加的\n", encoding="utf-8")  # 模板没有→原样保留
+    r = _run(_env(home, stack, auth, offline=True))
+    assert r.returncode == 0
+    tmpl = stack.parent / "template"
+    assert (stack / "compose.yaml").read_text(encoding="utf-8") == (tmpl / "compose.yaml").read_text(encoding="utf-8")
+    assert (stack / "catalog/mysql/profile").read_text(encoding="utf-8") == (tmpl / "catalog/mysql/profile").read_text(encoding="utf-8")
+    bak = list(stack.glob("*.bak-*"))
+    assert len(bak) == 1 and bak[0].name.startswith("compose.yaml.bak-")
+    assert bak[0].read_text(encoding="utf-8") == "# 我手工改过\n"
+    pbak = list((stack / "catalog/mysql").glob("profile.bak-*"))
+    assert len(pbak) == 1 and pbak[0].read_text(encoding="utf-8") == "mq\n"
+    assert (stack / "catalog/mysql/conf/my.cnf").read_text(encoding="utf-8") == "# 我加的\n"  # 本地新增文件不动
+    assert "备份" in r.stderr
+
 
 def test_jdk_state_defaults_preserved_and_corruption_reported(tmp_path):
     """空卷→内置 21；重建保留已有有效选择；损坏→日志明确报错且不重置（容器仍可进，jdk use 21 可修复）。"""

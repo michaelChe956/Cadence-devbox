@@ -71,4 +71,4 @@ Skill 调用：Claude/Kimi 原生调用；Codex/pi/omp 清单选择后将用途�
 
 > 以下配置由初始化脚本维护。
 
-- **产物自动提交（design/plan/code）**：关闭
+- **产物自动提交（design/plan/code）**：开启

@@ -152,12 +152,18 @@ Copy-Item "$repo\cadence-box.yaml.example"         C:\cadence\cadence-box.yaml
 
 **第 3 步：写 `stack\.env`（三行）**
 
+下面命令**整行复制粘贴**到 PowerShell 执行（不要用 `@"…"@` here-string 多行粘贴——控制台下易碎，也容易把命令原文误写进文件）：
+
 ```powershell
-@"
+"CADENCE_WORKSPACE=D:/code","CADENCE_DEVBOX_IMAGE=crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest","COMPOSE_PROFILES=" | Set-Content -Encoding utf8 C:\cadence\stack\.env
+```
+
+或者：记事本新建 `C:\cadence\stack\.env`，手工录入下面三行（KEY=VALUE，一行一条）：
+
+```ini
 CADENCE_WORKSPACE=D:/code
 CADENCE_DEVBOX_IMAGE=crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest
 COMPOSE_PROFILES=
-"@ | Set-Content -Encoding utf8 C:\cadence\stack\.env
 ```
 
 - `CADENCE_WORKSPACE`：你的代码父目录（几十个 git 仓库的上一级），将整体挂载为容器内 `/workspace`
@@ -564,6 +570,11 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 8. **`jdk use 8` 后重建容器又变回 21**：启动命令漏了 `-v cadence-jdks:/home/dev/.cadence/jdks`（§2.4）——状态只存在该卷里，没挂卷就只是容器内临时状态
 9. **关掉运维通道（no-sock）后 JDK 还能用吗**：能。sock 与 JDK 无关；`stack/docker-compose.no-sock.yml` 已保留 `cadence-jdks` 挂载，`jdk list`/`jdk use` 照常工作（该文件用 compose 的 `!override` 语法，需 compose 实现支持该标签；本机 `podman-compose` 版本解析该标签会报 `RepresenterError`，故未在本机实跑该文件，其挂载集合已按等价 `podman run` 逐个挂载实测通过）
 10. **`jdk` 相关报错怎么查**：见 §3.1.4 报错速查表（不支持版本 / 来源与哈希未成对 / 下载失败 / 哈希不符 / 状态损坏 / 卷未挂载 / 卷不可写 / 兜底入口拒绝回退）
+11. **容器日志报 `Permission denied`、启动即退出（Windows/podman）**：老环境的命名卷首挂时挂载点未被镜像预建，卷根成了 root 属主，容器内 dev(1000) 写不进。新镜像已在构建时预建全部挂载点（属 dev）；**已存在的坏卷不会被新镜像修复**，一次性修复命令（PowerShell，重复执行无害）：
+    ```powershell
+    "cadence-claude","cadence-codex","cadence-pi","cadence-agents","cadence-omp","cadence-npm","cadence-uv","cadence-pip" | ForEach-Object { podman run --rm -v "${_}:/d" docker.io/library/alpine:latest chown -R 1000:1000 /d }
+    ```
+    执行前先 `podman compose stop devbox`；修完 `podman compose up -d` 即可
 
 ## 8. Windows 真机验收（已执行：2026-09-21，维护者 michaelChe）
 
