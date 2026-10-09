@@ -8,10 +8,11 @@ devbox 的目标用户（弱技术 Windows 业务开发/测试）把应用跑在
 
 - 新增一键拉通脚本 `devbox/relay.ps1`（宿主侧）与 `devbox/relay-vm.sh`（VM 侧，经 `podman machine cp`/`ssh` 执行，遵循 install.ps1 已确立的"拷文件进 VM"模式，回避多层引号转义）
 - 链路（每个服务两跳本地中继）：`容器 → VM socat(23306/26379) → WSL mirrored 回环 127.0.0.1 → Windows netsh portproxy(13306/16379) → VPN → 远端`
-- 首跑交互问答收集中间件远端地址（mysql/redis 起步，服务表可扩展），存安装目录配置文件；重跑幂等，回显已有值可修改；Windows IP 变化后重跑即刷新
+- 首跑交互问答收集中间件远端地址（mysql/redis 起步，服务表可扩展），存安装目录配置文件；重跑幂等，回显已有值可修改；应用连接地址用 podman 网桥网关（稳定，不受宿主 DHCP 影响）
 - 子命令：默认 setup、`-Status`（查链路各跳状态）、`-Teardown`（对称还原，清掉本脚本创建的全部痕迹）
+- setup 前置检测端口占用：发现存量手搭中继（如 socat-mysql-relay）时报告占用者与处理路径（拆除/由脚本接管重建），不静默失败
 - `install.ps1` 完成提示追加一行指引（有远端中间件需求才跑，不打扰其他用户）
-- `devbox/README.md` 新增使用章节：运行方式、连接串含义、VPN 在线前提、路由器 DHCP 静态绑定建议
+- `devbox/README.md` 新增使用章节：运行方式、连接串含义（网桥网关地址）、VPN 在线前提、平台限制
 
 **非目标**：不支持 macOS 与 Hyper-V 后端（明确报错提示）；不做 VPN 内部域名解析（v1 用 IP）；不自动修改用户应用配置（只输出连接信息）；不替代 stack 自带中间件（端口错开并存）。
 

@@ -2,13 +2,13 @@
 
 ## 1. VM 侧脚本
 
-- [ ] 1.1 编写 `devbox/relay-vm.sh`（setup/status/teardown 三子命令：dnf 装 socat、按 `/etc/cadence-relay.env` 服务表启停监听、管理 `/usr/local/bin/cadence-relay-boot` 与 wsl.conf 钩子行），验证：`shellcheck devbox/relay-vm.sh` 零告警、`bash -n` 通过（映射 spec：一键建立通道、通道开机自恢复、对称拆除）
+- [ ] 1.1 编写 `devbox/relay-vm.sh`（setup/status/teardown 三子命令：dnf 装 socat、按 `/etc/cadence-relay.env` 服务表启停监听、systemd 服务管理——`machine ssh` 非交互 enable 不可用时回退 wsl.conf boot 钩子，实施首日先验证），验证：`shellcheck devbox/relay-vm.sh` 零告警、`bash -n` 通过（映射 spec：一键建立通道、通道开机自恢复、对称拆除）
 - [ ] 1.2 幂等性验证：连续两次执行 setup 后 `ss -tln` 中每个配置端口仍只有一个监听、wsl.conf 只有一行钩子（映射 spec：重复运行幂等）
 
 ## 2. 宿主侧脚本
 
 - [ ] 2.1 编写 `devbox/relay.ps1` 骨架：参数解析（-Status/-Teardown/-MySQL/-Redis）、平台守卫（Provider=wsl 且 Running）、管理员自提升、`relay.json` 读写与交互问答（回显可改），验证：非管理员窗口运行时触发 UAC 重启自身；hyperv 场景报错且无副作用（映射 spec：交互式配置与留痕、平台守卫）
-- [ ] 2.2 实现 setup 主流程：远端可达性预检（TcpClient 3s，失败即终止）→ netsh portproxy 增删（仅 127.0.0.1）→ `machine cp` 传递 relay-vm.sh 与渲染的服务表 env → `machine ssh` 执行 setup → 容器内 `/dev/tcp` 逐服务探活 → 打印连接信息，验证：对真实远端全流程跑通并输出 `IP:23306` 形态地址（映射 spec：一键建立通道、前置自检）
+- [ ] 2.2 实现 setup 主流程：远端可达性预检（TcpClient 3s，失败即终止）→ 端口占用冲突检测（存量手搭中继识别与迁移引导）→ 网桥网关动态发现（podman network inspect）→ netsh portproxy 增删（仅 127.0.0.1）→ `machine cp` 传递 relay-vm.sh 与渲染的服务表 env → `machine ssh` 执行 setup → 容器内 `/dev/tcp` 逐服务探活 → 打印连接信息，验证：对真实远端全流程跑通并输出 `网关:23306` 形态地址（映射 spec：一键建立通道、存量通道冲突检测、前置自检）
 - [ ] 2.3 实现 `-Status`：逐跳探测（portproxy 规则 / VM 监听 / 容器可达 / 宿主到远端）并输出差异化结论，VPN 断线时明确提示先连 VPN（映射 spec：状态查询）
 - [ ] 2.4 实现 `-Teardown`：按 relay.json 精确移除两侧痕迹 + 回显清单二次确认，验证：拆除后 `netsh interface portproxy show all` 不含本脚本端口、VM 内无 cadence-relay 残留（映射 spec：对称拆除）
 
@@ -24,4 +24,4 @@
 
 ## 5. 真机验收（维护者 Windows 机执行）
 
-- [ ] 5.1 全生命周期验收：setup（探活+连接信息）→ 应用以 `IP:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 七项 requirement 场景逐条对上
+- [ ] 5.1 全生命周期验收（维护者机已还原至初始态）：setup（探活+连接信息）→ 应用以 `网关:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 各项 requirement 场景逐条对上

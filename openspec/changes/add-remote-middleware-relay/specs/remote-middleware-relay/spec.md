@@ -8,15 +8,27 @@
 
 ### Requirement: 一键建立通道
 
-脚本 MUST 按服务表（mysql/redis 起步，端口约定错开 stack 自带中间件）在两侧建立中继：Windows 侧 netsh portproxy（仅监听 127.0.0.1，不暴露局域网）+ VM 侧 socat 中继（监听 0.0.0.0 供容器访问），并 MUST 在完成后输出容器内应用应使用的连接地址（宿主 IP + 中继端口）。
+脚本 MUST 按服务表（mysql/redis 起步，端口约定错开 stack 自带中间件）在两侧建立中继：Windows 侧 netsh portproxy（仅监听 127.0.0.1，不暴露局域网）+ VM 侧 socat 中继（仅绑定 podman 网桥网关地址，容器网段可达），并 MUST 在完成后输出容器内应用应使用的连接地址（podman 网桥网关 IP + 中继端口）。
 
 #### Scenario: 首次拉通 mysql 与 redis
 - **WHEN** 用户在已安装 devbox 的 Windows 宿主以管理员运行 setup，提供 mysql=10.129.12.75:3306、redis=10.129.20.31:6379
-- **THEN** 两侧中继建成，脚本从 devbox 容器内对 23306/26379 做 TCP 探活全部通过，并打印形如 `mysql → 192.168.50.206:23306`、`redis → 192.168.50.206:26379` 的连接信息
+- **THEN** 两侧中继建成，脚本从 devbox 容器内对网桥网关 23306/26379 做 TCP 探活全部通过，并打印形如 `mysql → 10.89.0.1:23306`、`redis → 10.89.0.1:26379` 的连接信息（podman 网桥网关，动态发现）
 
 #### Scenario: 重复运行幂等
 - **WHEN** 用户对同一配置再次运行 setup
 - **THEN** 不产生重复的 portproxy 规则、中继进程或开机钩子，最终状态与首次运行后一致
+
+#### Scenario: 宿主 IP 变化不影响通道
+- **WHEN** Windows 网卡 IP 因 DHCP 发生变化
+- **THEN** 中继、portproxy 与容器内连接地址均不受影响，无需任何操作
+
+### Requirement: 存量通道冲突检测
+
+setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本创建的占用（如手工搭建的中继服务）时 MUST 报告占用者并提供处理路径（先拆除或由本脚本接管重建），MUST 不静默失败或与占用者抢端口。
+
+#### Scenario: 端口被手搭中继占用
+- **WHEN** VM 内网桥网关的 23306 已被名为 socat-mysql-relay 的手搭 systemd 服务监听时运行 setup
+- **THEN** 脚本报告占用者与处理路径，用户确认拆除后 setup 接管该端口并正常完成
 
 ### Requirement: 交互式配置与留痕
 
