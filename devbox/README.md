@@ -309,6 +309,40 @@ Linux 下 devbox 启动命令在 §2.4 基础上**必须加 `--userns=keep-id`**
 
 stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适配 podman 双形态。
 
+### 2.6 连接你自己的远端中间件（VPN，Windows 专用）
+
+> 适用：中间件在**公司内网**、只能从 Windows 宿主经 VPN（如 aTrust）访问——容器直连 VPN 网段不通（VPN 丢弃一切 NAT 转发流量，实测定论）。基于 2026-10-09 真机验证链路产品化，完整设计见 OpenSpec `add-remote-middleware-relay`。
+
+**前提**：Windows + Podman Desktop（WSL 后端，mirrored 网络）｜管理员 PowerShell（脚本自动 UAC 提权）｜VPN 已连｜stack 已启动（§2.4）。**不支持** macOS 与 Hyper-V 后端。
+
+**一条命令拉通**（仓库根目录执行）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1
+```
+
+- 首次运行问答输入远端地址（`IP:端口`，如 `10.129.12.75:3306`；域名暂不支持）；也可参数直传 `-MySQL 10.129.12.75:3306 -Redis 10.x.x.x:6379`
+- 配置留痕 `<安装目录>\relay.json`：重跑回显旧值、回车保留；改地址重跑即生效
+- 完成后打印容器内应用应使用的连接地址：
+
+```text
+mysql → 10.89.0.1:23306      # podman 网桥网关，稳定，不随宿主 DHCP 变化
+redis → 10.89.0.1:26379
+```
+
+**链路**（4 跳，全自动搭建与验证）：容器 → VM socat（绑网桥网关）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；重启自动恢复（systemd 优先，wsl.conf 钩子兜底）。
+
+**日常**：
+
+```powershell
+# 逐跳体检：portproxy / VM 监听 / 容器可达 / 远端可达；VPN 掉线会明确提示
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status
+# 对称拆除（含确认清单），恢复到通道建立前
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown
+```
+
+**注意**：VPN 断开则应用连不上（预期行为，`-Status` 可区分）；端口与 stack 自带中间件错开（本地 13306/16379、容器侧 23306/26379 vs stack 的 3306/6379），两套并存互不影响；检测到存量手搭中继占用端口时先征求确认再接管。
+
 ## 3. 日常使用
 
 | 场景 | 操作 |

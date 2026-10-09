@@ -199,5 +199,6 @@ Write-Host @"
   3. 换 key/换模型：改 $InstallDir\cadence-box.yaml → podman restart devbox
   4. 加开中间件（容器内）：stack enable mq   # rabbitmq；stack enable storage   # minio
   5. 日常开关：podman stop devbox / podman start devbox（machine 随 Podman Desktop 起）
+  6. 要连公司远端中间件（VPN 侧 MySQL/Redis）：.\devbox\relay.ps1（手册 §2.6）
 "@
 Info '安装完成。'
