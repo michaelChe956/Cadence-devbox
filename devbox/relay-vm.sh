@@ -5,7 +5,7 @@
 # 端口被占且未带 --force 时 exit 3（relay.ps1 据此询问用户后重试接管）。
 set -u
 
-ENV_FILE=/etc/cadence-relay.env
+ENV_FILE=${RELAY_ENV_FILE:-/etc/cadence-relay.env}
 RUN_SCRIPT=/usr/local/bin/cadence-relay-run
 BOOT_SCRIPT=/usr/local/bin/cadence-relay-boot
 UNIT_FILE=/etc/systemd/system/cadence-relay.service
@@ -23,6 +23,7 @@ read_env() {
   local name vmport bindaddr hostport
   while read -r name vmport bindaddr hostport; do
     case "$name" in '' | '#'* ) continue ;; esac
+    hostport=${hostport%$'\r'}
     if [ -z "${vmport:-}" ] || [ -z "${bindaddr:-}" ] || [ -z "${hostport:-}" ]; then
       die "env 行格式错误（应为 name vmport bindaddr hostport）：$name"
     fi
@@ -64,12 +65,21 @@ LOG_FILE=/var/log/cadence-relay.log
 SOCAT=$(command -v socat || echo /usr/sbin/socat)
 HEADER
   cat >> "$RUN_SCRIPT" <<'BODY'
-while read -r name vmport bindaddr hostport; do
-  case "$name" in '' | '#'* ) continue ;; esac
-  pkill -f "TCP-LISTEN:$vmport" 2>/dev/null || true
-  nohup "$SOCAT" "TCP-LISTEN:$vmport,bind=$bindaddr,fork,reuseaddr" \
-    "TCP:127.0.0.1:$hostport" >>"$LOG_FILE" 2>&1 &
-done < "$ENV_FILE"
+while :; do
+  all=1
+  while read -r name vmport bindaddr hostport; do
+    case "$name" in '' | '#'* ) continue ;; esac
+    hostport=${hostport%$'\r'}
+    if ! ss -tln | awk -v p=":$vmport\$" '$4 ~ p' | grep -q .; then
+      all=0
+      pkill -f "TCP-LISTEN:$vmport" 2>/dev/null || true
+      nohup "$SOCAT" "TCP-LISTEN:$vmport,bind=$bindaddr,fork,reuseaddr" \
+        "TCP:127.0.0.1:$hostport" >>"$LOG_FILE" 2>&1 &
+    fi
+  done < "$ENV_FILE"
+  [ "$all" -eq 1 ] && break
+  sleep 3
+done
 wait
 BODY
   chmod +x "$RUN_SCRIPT"
@@ -166,6 +176,7 @@ cmd_status() {
   local line name vmport bindaddr hostport fail=0
   for line in "${RELAY_LINES[@]}"; do
     read -r name vmport _ hostport <<< "$line"
+    hostport=${hostport%$'\r'}
     if listener_up "$vmport"; then
       log "$name: VM 监听 :$vmport OK"
     else

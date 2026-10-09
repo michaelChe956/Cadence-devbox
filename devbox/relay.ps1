@@ -39,6 +39,7 @@ if (-not (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdent
   if ($Teardown) { $argList += '-Teardown' }
   if ($MySQL)    { $argList += @('-MySQL', ('"{0}"' -f $MySQL)) }
   if ($Redis)    { $argList += @('-Redis', ('"{0}"' -f $Redis)) }
+  if ($InstallDir) { $argList += @('-InstallDir', ('"{0}"' -f $InstallDir)) }
   Start-Process powershell -Verb RunAs -ArgumentList $argList
   exit
 }
@@ -126,6 +127,13 @@ function Test-ContainerPort($ctr, $gw, $port) {
   return (($out -join '').Trim()) -eq 'OK'
 }
 
+function Undo-Portproxy($ports) { # 失败路径回滚已建 portproxy，避免无留痕残留
+  foreach ($p in $ports) {
+    $null = cmd /c "netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=$p 2>nul"
+    Warn "已回滚 portproxy 127.0.0.1:$p"
+  }
+}
+
 # ---- 通道搭建 ----
 function Invoke-Setup {
   $cfg = Load-Config
@@ -141,12 +149,15 @@ function Invoke-Setup {
 
   $gw = Get-BridgeGateway
   Info "podman 网桥网关：$gw（连接地址将形如 ${gw}:23306，稳定不随 DHCP 变化）"
+  $ctr = Get-DevboxContainer
 
   # Windows 侧 portproxy：幂等（先删同监听端口旧规则再建，仅 127.0.0.1，不暴露局域网）
+  $created = @()
   foreach ($s in $services) {
     $null = cmd /c "netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=$($s.hostPort) 2>nul"
     $null = cmd /c "netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=$($s.hostPort) connectaddress=$($s.remoteHost) connectport=$($s.remotePort)"
-    if ($LASTEXITCODE -ne 0) { Die "portproxy 写入失败（$($s.name) :$($s.hostPort)），请以管理员运行" }
+    if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die "portproxy 写入失败（$($s.name) :$($s.hostPort)），请以管理员运行" }
+    $created += $s.hostPort
     Info "portproxy：127.0.0.1:$($s.hostPort) → $($s.remoteHost):$($s.remotePort)"
   }
 
@@ -154,24 +165,23 @@ function Invoke-Setup {
   $envFile = Join-Path $env:TEMP 'cadence-relay.env'
   $envLines = @('# name vmport bindaddr hostport')
   foreach ($s in $services) { $envLines += "$($s.name) $($s.vmPort) $gw $($s.hostPort)" }
-  $envLines | Set-Content -Encoding ascii $envFile
+  ($envLines -join "`n") + "`n" | Set-Content -Encoding ascii -NoNewline $envFile
   podman machine cp "$PSScriptRoot\relay-vm.sh" "${mach}:/tmp/cadence-relay-vm.sh"
-  if ($LASTEXITCODE -ne 0) { Die 'machine cp relay-vm.sh 失败' }
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay-vm.sh 失败' }
   podman machine cp "$envFile" "${mach}:/tmp/cadence-relay.env"
-  if ($LASTEXITCODE -ne 0) { Die 'machine cp relay.env 失败' }
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay.env 失败' }
   $null = podman machine ssh "sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh && sudo mv /tmp/cadence-relay.env /etc/cadence-relay.env"
 
   $null = podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh setup'
   if ($LASTEXITCODE -eq 3) {
     Warn 'VM 侧端口被存量监听占用（如手搭中继 socat-mysql-relay）。'
     $ans = Read-Host '确认拆除占用者并由本脚本接管？(Y/N)'
-    if ($ans -notmatch '^[Yy]') { Die '已取消。可先手工拆除占用者后重跑' }
+    if ($ans -notmatch '^[Yy]') { Undo-Portproxy $created; Die '已取消。可先手工拆除占用者后重跑' }
     $null = podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh setup --force'
   }
-  if ($LASTEXITCODE -ne 0) { Die "VM 侧 setup 失败（exit $LASTEXITCODE），日志：podman machine ssh 'tail /var/log/cadence-relay.log'" }
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die "VM 侧 setup 失败（exit $LASTEXITCODE），日志：podman machine ssh 'tail /var/log/cadence-relay.log'" }
 
   # 容器内端到端探活
-  $ctr = Get-DevboxContainer
   $fail = @()
   foreach ($s in $services) {
     if (Test-ContainerPort $ctr $gw $s.vmPort) { Info "$($s.name)：容器 → ${gw}:$($s.vmPort) OK" }
@@ -180,6 +190,13 @@ function Invoke-Setup {
 
   # 留痕（成功才落盘，teardown 按此精确回滚）
   @{ version = 1; services = $services } | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii $RelayJson
+
+  # 存量安装目录的 .gitignore 可能早于 relay 存在：补一行防误提交内网 IP 配置
+  $gi = Join-Path $InstallDir '.gitignore'
+  if (Test-Path $gi) {
+    $cur = @(Get-Content $gi)
+    if ($cur -notcontains 'relay.json') { Add-Content -Encoding ascii -Path $gi -Value 'relay.json' }
+  }
 
   Info '完成。容器内应用连接地址（podman 网桥网关，稳定）：'
   foreach ($s in $services) { Write-Host "  $($s.name) → ${gw}:$($s.vmPort)" }
@@ -192,7 +209,7 @@ function Invoke-Status {
   if (-not $cfg) { Die "无 $RelayJson——通道未建立，先运行 setup" }
   $rules = (cmd /c 'netsh interface portproxy show all') -join "`n"
   foreach ($s in $cfg.services) {
-    $h1 = ($rules -match ("127\.0\.0\.1\s+" + $s.hostPort + "\s+"))
+    $h1 = ($rules -match ('(?m)^\s*127\.0\.0\.1\s+' + $s.hostPort + '\s+'))
     if ($h1) { Info "$($s.name) hop1 portproxy 127.0.0.1:$($s.hostPort) OK" }
     else { Warn "$($s.name) hop1 portproxy 缺失——重跑 setup 重建" }
   }
@@ -201,13 +218,13 @@ function Invoke-Status {
   $ctr = ''
   if ((Probe 'podman container inspect devbox')) { $ctr = 'devbox' }
   elseif ((Probe 'podman container inspect cadence_devbox_1')) { $ctr = 'cadence_devbox_1' }
-  if ($ctr) {
+  if ($ctr -and (Probe 'podman network inspect cadence_default')) {
     $gw = Get-BridgeGateway
     foreach ($s in $cfg.services) {
       if (Test-ContainerPort $ctr $gw $s.vmPort) { Info "$($s.name) hop3 容器 → ${gw}:$($s.vmPort) OK" }
       else { Warn "$($s.name) hop3 容器 → ${gw}:$($s.vmPort) FAIL——VM 中继未监听则重跑 setup" }
     }
-  } else { Warn 'devbox 容器未运行，跳过容器侧探测' }
+  } else { Warn 'devbox 容器或 stack 网络未起，跳过容器侧探测（hop3）' }
   $vpnDown = @()
   foreach ($s in $cfg.services) {
     if (-not (Test-RemotePort $s.remoteHost $s.remotePort)) { $vpnDown += $s.name }
@@ -231,8 +248,10 @@ function Invoke-Teardown {
     $null = cmd /c "netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=$($s.hostPort) 2>nul"
     Info "portproxy 127.0.0.1:$($s.hostPort) 已删"
   }
-  podman machine cp "$PSScriptRoot\relay-vm.sh" "${mach}:/tmp/cadence-relay-vm.sh" | Out-Null
+  podman machine cp "$PSScriptRoot\relay-vm.sh" "${mach}:/tmp/cadence-relay-vm.sh"
+  if ($LASTEXITCODE -ne 0) { Die 'machine cp 失败（machine 停止？）——已保留 relay.json，恢复后重跑 -Teardown' }
   $null = podman machine ssh 'sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh && sudo bash /usr/local/bin/relay-vm.sh teardown'
+  if ($LASTEXITCODE -ne 0) { Die 'VM 侧 teardown 失败——已保留 relay.json，恢复后重跑 -Teardown' }
   Remove-Item $RelayJson -ErrorAction SilentlyContinue
   Info 'teardown 完成，两侧已还原到通道建立前'
 }

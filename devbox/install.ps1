@@ -85,7 +85,7 @@ if (Test-Path "$InstallDir\stack\.env") {
   "CADENCE_WORKSPACE=$ws`nCADENCE_DEVBOX_IMAGE=$Image`nCOMPOSE_PROFILES=" | Set-Content "$InstallDir\stack\.env" -Encoding ascii
 }
 # 本地 .gitignore（安装目录不是 git 仓库时亦预留）
-"cadence-box.yaml`nstack/.env`nstack/CHANGES.md`nstack/data/`n" | Set-Content "$InstallDir\.gitignore" -Encoding ascii
+"cadence-box.yaml`nstack/.env`nstack/CHANGES.md`nstack/data/`nrelay.json`n" | Set-Content "$InstallDir\.gitignore" -Encoding ascii
 Info "请编辑 $InstallDir\cadence-box.yaml 填写 provider 端点/key/模型（git.name/email 也要填）"
 $done = Read-Host '填完后按回车继续（Ctrl+C 退出先去填）'
 

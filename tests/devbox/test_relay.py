@@ -75,3 +75,42 @@ def test_readme_has_relay_section():
     assert "### 2.6" in text, "README 缺 §2.6"
     section = text.split("### 2.6", 1)[1].split("## 3.", 1)[0]
     assert "relay.ps1" in section, "§2.6 未包含 relay.ps1 使用说明"
+
+
+def test_relay_env_crlf_tolerated(tmp_path):
+    """CRLF 行尾 env（PS Set-Content 默认产物）必须正确解析——真机首跑必败回归。"""
+    import os
+
+    env = tmp_path / "cadence-relay.env"
+    env.write_bytes(b"mysql 23306 127.0.0.1 13306\r\n")
+    result = subprocess.run(
+        ["bash", str(RELAY_VM), "status"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "RELAY_ENV_FILE": str(env)},
+    )
+    out = result.stdout + result.stderr
+    assert "格式错误" not in out
+    assert ":23306" in out, "vmport 解析失败"
+    assert "127.0.0.1:13306" in out, "hostport 解析失败"
+
+
+def test_relay_ps1_fix_pins():
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "-NoNewline" in text, "env 写入须避免 CRLF（-NoNewline 手工拼 LF）"
+    assert "Undo-Portproxy" in text, "改动后失败路径须回滚 portproxy"
+    assert "已保留 relay.json" in text, "teardown 失败须保留留痕可重试"
+    assert "'-InstallDir'" in text, "UAC 自提升须转发 -InstallDir"
+
+
+def test_relay_vm_sh_retry_and_override():
+    text = RELAY_VM.read_text(encoding="utf-8")
+    assert "RELAY_ENV_FILE" in text, "env 路径须可覆盖（可测性）"
+    assert "while :" in text, "run 脚本须带重试循环（网桥未就绪自愈）"
+
+
+def test_install_ps1_gitignore_covers_relay_json():
+    text = INSTALL_PS1.read_text(encoding="utf-8")
+    lines = [l for l in text.splitlines() if "stack/data/" in l]
+    assert lines and "relay.json" in lines[0], "安装器写出的 .gitignore 未含 relay.json"
