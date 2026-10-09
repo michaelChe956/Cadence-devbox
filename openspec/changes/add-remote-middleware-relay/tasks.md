@@ -2,7 +2,7 @@
 
 ## 1. VM 侧脚本
 
-- [ ] 1.1 编写 `devbox/relay-vm.sh`（setup/status/teardown 三子命令：dnf 装 socat、按 `/etc/cadence-relay.env` 服务表启停监听、systemd 服务管理——`machine ssh` 非交互 enable 不可用时回退 wsl.conf boot 钩子，实施首日先验证），验证：`shellcheck devbox/relay-vm.sh` 零告警、`bash -n` 通过（映射 spec：一键建立通道、通道开机自恢复、对称拆除）
+- [x] 1.1 编写 `devbox/relay-vm.sh`（setup/status/teardown 三子命令：dnf 装 socat、按 `/etc/cadence-relay.env` 服务表启停监听、systemd 服务管理——`machine ssh` 非交互 enable 不可用时回退 wsl.conf boot 钩子，实施首日先验证），验证：`shellcheck devbox/relay-vm.sh` 零告警、`bash -n` 通过（映射 spec：一键建立通道、通道开机自恢复、对称拆除）
 - [ ] 1.2 幂等性验证：连续两次执行 setup 后 `ss -tln` 中每个配置端口仍只有一个监听、wsl.conf 只有一行钩子（映射 spec：重复运行幂等）
 
 ## 2. 宿主侧脚本
@@ -19,8 +19,8 @@
 
 ## 4. 自动化测试
 
-- [ ] 4.1 pytest 结构测试：relay.ps1 / relay-vm.sh 存在且含关键结构（子命令、端口表）；端口表与 compose.yaml 发布端口无重叠断言；验证：`pytest tests/devbox` 全绿（含既有 46 项不回归）
-- [ ] 4.2 CI 覆盖：确认 ShellCheck 已拾取 relay-vm.sh（无 .shellcheckrc 排除），验证：本地 `shellcheck` 与 CI 一致
+- [x] 4.1 pytest 结构测试：relay.ps1 / relay-vm.sh 存在且含关键结构（子命令、端口表）；端口表与 compose.yaml 发布端口无重叠断言；验证：`pytest tests/devbox` 全绿（含既有 46 项不回归）——实测 104 passed（含评审修复回归测试）
+- [x] 4.2 CI 覆盖：确认 ShellCheck 已拾取 relay-vm.sh（无 .shellcheckrc 排除），验证：本地 `shellcheck` 与 CI 一致
 
 ## 5. 真机验收（维护者 Windows 机执行）
 
