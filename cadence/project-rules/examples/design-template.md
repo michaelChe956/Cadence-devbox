@@ -25,7 +25,7 @@
 ## 1. 项目事实确认（必须先填写）
 
 > 本节是后续所有设计决策的依据。未确认项目事实前，不要写技术方案。
-> **本仓库预填说明**：§1 与 §4.1 已按 Cadence-devbox 仓库事实预填（基线 2026-09-11）；使用前逐项复核是否仍与代码一致。
+> **本仓库预填说明**：§1 与 §4.1 已按 Cadence-devbox 仓库事实预填（基线 2026-09-11，2026-09-23 复核）；使用前逐项复核是否仍与代码一致。
 
 ### 1.1 项目类型
 
@@ -39,10 +39,10 @@
 | 维度 | 当前技术 | 版本/备注 |
 |------|----------|-----------|
 | 语言 | Python（仅 stdlib + PyYAML）与 Bash 为主，少量 PowerShell | Python 3.14 / PyYAML 6.0.3，pin 见 `devbox/versions.env` |
-| 框架 | 无 Web 框架；4 层 Dockerfile + Podman/compose 编排 + argparse CLI | `compose.yaml`；`stack/stack.sh` + `stack-lib.sh` |
+| 框架 | 无 Web 框架；4 层 Dockerfile + Podman/compose 编排 + argparse CLI + JDK/Maven 工具链脚本 | `compose.yaml`；`stack/stack.sh` + `stack-lib.sh`；`jdk.sh` + `jdk-shim.sh`（temurin-21 切换） |
 | 数据访问 | 无数据库/ORM；输入 `cadence-box.yaml`，输出五端 CLI 配置文件 | `render-auth.py`，临时目录全量渲染后 `os.replace` 原子替换 |
 | 通信方式 | 容器进程 + compose 服务网络；CLI 子命令交互（无 REST/RPC/MQ 契约） | `stack.sh <子命令>` → `catalog/<组件>/` |
-| 测试框架 | pytest + ShellCheck（push/PR 触发 CI） | pytest 9.1.1，46 项，位于 `tests/devbox/` |
+| 测试框架 | pytest + ShellCheck（push/PR 触发 CI） | pytest 9.1.1，90 项，位于 `tests/devbox/` |
 
 ### 1.3 现有约定（禁止猜测）
 
@@ -50,7 +50,7 @@
 - 响应结构: 无 HTTP 契约；CLI 以 stdout 文本 + exit code 表达结果（成功 0 / 失败非 0，错误信息走 stderr）
 - 异常体系: Bash 全程 `set -o pipefail` 语义（含专项回归测试）；Python 侧 argparse 校验失败非 0 退出
 - 日志体系: [待补充：仓库暂无统一日志规范，确认后回填]
-- 分层/目录组织: `devbox/`（Dockerfile、compose.yaml、entrypoint.sh、render-auth.py、install.ps1、versions.env）→ `devbox/stack/`（stack.sh → stack-lib.sh → catalog/\<mysql|redis|rabbitmq|minio\>/）→ `tests/devbox/`（pytest）
+- 分层/目录组织: `devbox/`（Dockerfile、compose.yaml、entrypoint.sh、render-auth.py、jdk.sh、jdk-shim.sh、install.ps1、versions.env）→ `devbox/stack/`（stack.sh → stack-lib.sh → catalog/\<mysql|redis|rabbitmq|minio\>/）→ `tests/devbox/`（pytest）
 
 ### 1.4 兼容性边界
 
