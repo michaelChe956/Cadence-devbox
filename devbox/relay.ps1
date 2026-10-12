@@ -34,7 +34,7 @@ function Probe($cmd) { (RunQuiet $cmd).ok }
 if (-not (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
   Info '需要管理员权限，弹出 UAC 后请在新窗口继续…'
-  $argList = @('-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+  $argList = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
   if ($Status)   { $argList += '-Status' }
   if ($Teardown) { $argList += '-Teardown' }
   if ($MySQL)    { $argList += @('-MySQL', ('"{0}"' -f $MySQL)) }
