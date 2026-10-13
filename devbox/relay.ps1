@@ -5,6 +5,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -MySQL 10.x.x.x:3306  # 参数覆盖问答
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status               # 逐跳状态
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown             # 对称拆除
+#   存量安装目录（非仓库旁 cadence）须带 -InstallDir <目录>，如 -InstallDir D:\testpodman\cadence
 param(
   [switch]$Status,
   [switch]$Teardown,
@@ -18,7 +19,18 @@ $RelayJson = Join-Path $InstallDir 'relay.json'
 
 function Info($m) { Write-Host "[cadence-relay] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[cadence-relay][警告] $m" -ForegroundColor Yellow }
-function Die($m)  { Write-Host "[cadence-relay][错误] $m" -ForegroundColor Red; exit 1 }
+function Die($m)  {
+  Write-Host "[cadence-relay][错误] $m" -ForegroundColor Red
+  # 双击直接运行（父进程 explorer）时窗口随退出即关：停一拍让错误可见
+  try {
+    $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+    if ((Get-Process -Id $parent -ErrorAction SilentlyContinue).ProcessName -eq 'explorer') {
+      Write-Host '按回车键关闭本窗口…' -ForegroundColor DarkGray
+      [void](Read-Host)
+    }
+  } catch { }
+  exit 1
+}
 
 # 原生命令静默探测（$ErrorActionPreference=Stop 时原生 stderr 会抛异常，经 cmd /c 绕开）
 function RunQuiet($cmd) {
@@ -30,33 +42,80 @@ function RunQuiet($cmd) {
 }
 function Probe($cmd) { (RunQuiet $cmd).ok }
 
+# 探测并保留原生命令的 stderr 文本（cmd 内部 2>&1 合并，绕开 EAP=Stop 对原生 stderr 的干扰）：
+# 守卫用它把 podman 的真实报错带回给用户，杜绝静默失败（旧守卫 2>nul 吞掉了报错）
+function RunLoud($cmd) {
+  $ErrorActionPreference = 'Continue'
+  $out = cmd /c "$cmd 2>&1"
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  $text = (@($out | Where-Object { $_ -is [string] }) -join ' ').Trim()
+  return @{ ok = ($code -eq 0); code = $code; out = $text }
+}
+
 # ---- 管理员自提升（portproxy 需要管理员） ----
 if (-not (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
-  Info '需要管理员权限，弹出 UAC 后请在新窗口继续…'
+  Info '需要管理员权限，弹出 UAC 后在新窗口继续；本窗口使命到此结束'
   $argList = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
   if ($Status)   { $argList += '-Status' }
   if ($Teardown) { $argList += '-Teardown' }
   if ($MySQL)    { $argList += @('-MySQL', ('"{0}"' -f $MySQL)) }
   if ($Redis)    { $argList += @('-Redis', ('"{0}"' -f $Redis)) }
   if ($InstallDir) { $argList += @('-InstallDir', ('"{0}"' -f $InstallDir)) }
-  Start-Process powershell -Verb RunAs -ArgumentList $argList
-  exit
+  try { Start-Process powershell -Verb RunAs -ArgumentList $argList }
+  catch { Die "UAC 提权被拒绝或失败：$($_.Exception.Message)" }
+  exit 0
 }
 
 # ---- 平台守卫：仅 Windows + WSL 后端 podman machine ----
 if (-not (Get-Command podman -ErrorAction SilentlyContinue)) {
   Die '未检测到 podman，请先安装并启动 Podman Desktop（手册 §2.1）'
 }
-$machInfo = RunQuiet 'podman machine inspect --format "{{.Provider}} {{.State}}"'
-if (-not $machInfo.ok -or -not $machInfo.out) { Die 'podman machine 不存在：先 podman machine init && podman machine start' }
-$machParts = $machInfo.out -split '\s+'
-if ($machParts[0] -ne 'wsl') {
-  Die "仅支持 WSL 后端 podman machine（当前 $($machParts[0])），见手册 §2.6 平台限制"
+
+# 从合并输出定位 JSON 文档起点：podman 日志行自带 WARN[0000]/LEVEL[0000] 这类含 [ 的
+# 前缀，首个 [ 未必是 JSON——逐候选起点尝试解析，成功即用；全部失败返回 $null
+function ConvertFrom-JsonText($text) {
+  if (-not $text) { return $null }
+  for ($i = 0; $i -lt $text.Length; $i++) {
+    if ($text[$i] -ne '[' -and $text[$i] -ne '{') { continue }
+    try { return (ConvertFrom-Json $text.Substring($i)) } catch { }
+  }
+  return $null
 }
-if ($machParts[1] -notmatch 'running') { Die 'podman machine 未运行：podman machine start 后重试' }
-$mach = (RunQuiet 'podman machine inspect --format "{{.Name}}"').out
-if (-not $mach) { Die '无法取得 podman machine 名称' }
+
+# 守卫数据源唯一：podman machine list --format json（官方稳定接口，podman≥3.4 提供
+# Name/Default/Running/VMType）。machine inspect 的 InspectInfo 在任何版本都无
+# Provider/VMType 字段（现行 man page 仅 State/Name 等），勿作回退源；
+# --format "{{.Provider}}" 任何版本必模板报错。失败必须带原始 stderr 与退出码显式终止
+function Resolve-Machine {
+  $ml = RunLoud 'podman machine list --format json'
+  if (-not $ml.ok) { Die "podman machine list 失败（exit $($ml.code)）：$($ml.out)" }
+  $mach = $null
+  $list = ConvertFrom-JsonText $ml.out
+  if ($list) {
+    $arr = @($list)
+    if ($arr.Count -gt 0) {
+      $mach = @($arr | Where-Object { $_.Default })[0]
+      if (-not $mach) { $mach = $arr[0] }
+    }
+  }
+  if (-not $mach) { Die "podman machine 不存在或 list 输出无法解析：$($ml.out)" }
+  $vmType = ''
+  if ($mach.PSObject.Properties['VMType']) { $vmType = [string]$mach.VMType }
+  $running = $null
+  if ($mach.PSObject.Properties['Running']) { $running = [bool]$mach.Running }
+  if (-not $vmType -or $null -eq $running) {
+    Die "无法从 podman machine list 读取 VMType/Running：$($ml.out)"
+  }
+  if ($vmType -ne 'wsl') { Die "仅支持 WSL 后端 podman machine（当前 $vmType），见手册 §2.6 平台限制" }
+  if ($running -ne $true) { Die "podman machine 未运行：podman machine start 后重试" }
+  $name = ''
+  if ($mach.PSObject.Properties['Name']) { $name = [string]$mach.Name }
+  if (-not $name) { Die '无法取得 podman machine 名称' }
+  return $name
+}
+$mach = Resolve-Machine
 
 # ---- 服务表（与 stack 自带中间件端口错开：compose 发布 3306/6379/5672/15672/9000/9001/3000/8080） ----
 $ServiceDefaults = [ordered]@{
@@ -257,7 +316,12 @@ function Invoke-Teardown {
 }
 
 # ---- 入口 ----
-if ($Status -and $Teardown) { Die '-Status 与 -Teardown 互斥' }
-if ($Status)   { Invoke-Status; exit 0 }
-if ($Teardown) { Invoke-Teardown; exit 0 }
-Invoke-Setup
+try {
+  if ($Status -and $Teardown) { Die '-Status 与 -Teardown 互斥' }
+  if ($Status)   { Invoke-Status; exit 0 }
+  if ($Teardown) { Invoke-Teardown; exit 0 }
+  Invoke-Setup
+  exit 0
+} catch {
+  Die "未预期的错误：$($_.Exception.Message)"
+}

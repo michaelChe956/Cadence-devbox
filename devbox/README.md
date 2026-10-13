@@ -323,6 +323,8 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1
 
 - 首次运行问答输入远端地址（`IP:端口`，如 `10.129.12.75:3306`；域名暂不支持）；也可参数直传 `-MySQL 10.129.12.75:3306 -Redis 10.x.x.x:6379`
 - 配置留痕 `<安装目录>\relay.json`：重跑回显旧值、回车保留；改地址重跑即生效
+- 存量安装目录（非仓库旁 `cadence`，如早期 `-InstallDir D:\testpodman\cadence`）：
+  `-Status`/`-Teardown` 也要带同一 `-InstallDir`，`relay.json` 位置不变、无需迁移
 - 完成后打印容器内应用应使用的连接地址：
 
 ```text
@@ -341,7 +343,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown
 ```
 
-**注意**：VPN 断开则应用连不上（预期行为，`-Status` 可区分）；端口与 stack 自带中间件错开（本地 13306/16379、容器侧 23306/26379 vs stack 的 3306/6379），两套并存互不影响；检测到存量手搭中继占用端口时先征求确认再接管。
+**注意**：VPN 断开则应用连不上（预期行为，`-Status` 可区分）；端口与 stack 自带中间件错开（本地 13306/16379、容器侧 23306/26379 vs stack 的 3306/6379），两套并存互不影响；检测到存量手搭中继占用端口时先征求确认再接管。平台守卫按官方 `podman machine list --format json` 的 `VMType`/`Running` 判定 WSL 后端与运行状态（`machine inspect` 输出无 `Provider` 字段，勿用 `--format "{{.Provider}}"`）；一切失败均以红字带 podman 原始报错文本退出（exit 1），不会静默——双击直接运行时窗口会停住等回车再关。
 
 ## 3. 日常使用
 
