@@ -6,8 +6,11 @@
 """
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -110,12 +113,6 @@ def test_relay_ps1_fix_pins():
     assert "Undo-Portproxy" in text, "改动后失败路径须回滚 portproxy"
     assert "已保留 relay.json" in text, "teardown 失败须保留留痕可重试"
     assert "'-InstallDir'" in text, "UAC 自提升须转发 -InstallDir"
-
-
-def test_relay_vm_sh_retry_and_override():
-    text = RELAY_VM.read_text(encoding="utf-8")
-    assert "RELAY_ENV_FILE" in text, "env 路径须可覆盖（可测性）"
-    assert "while :" in text, "run 脚本须带重试循环（网桥未就绪自愈）"
 
 
 def test_install_ps1_gitignore_covers_relay_json():
@@ -311,3 +308,631 @@ def test_die_exits_nonzero_and_prints(tmp_path):
     r = _run_harness(DIE_HARNESS, tmp_path)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "boom-die" in r.stdout
+
+# ---------------------------------------------------------------------------
+# relay-vm.sh 每服务 systemd 持久化：沙箱真实行为回归（2026-10-14 固化裁决）。
+# 桩均为“真实执行”型：fake systemctl 对 cadence-relay@X 的 start/restart
+# 真拉起沙箱 run 脚本（真实监听进程、真实 cmdline，MainPID 语义与 systemd 一致）；
+# fake ss 扫 /proc 反映进程真实存亡。断言只看真实副作用：
+# 进程生死、文件系统、退出码、systemctl 调用记录。
+
+FAKE_SS = r'''#!/bin/sh
+# 测试桩 ss：扫 /proc，把 cmdline 带 TCP-LISTEN: 参数的进程报成监听行
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  args=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null) || continue
+  l=$(printf '%s\n' "$args" | grep '^TCP-LISTEN:' | head -1)
+  [ -n "$l" ] || continue
+  port=${l#TCP-LISTEN:}; port=${port%%,*}
+  bind=
+  for seg in $(printf '%s' "$l" | tr ',' ' '); do
+    case $seg in bind=*) bind=${seg#bind=} ;; esac
+  done
+  echo "LISTEN 0 128 $bind:$port 0.0.0.0:* users:((\"socat\",pid=$pid,fd=4))"
+done
+exit 0
+'''
+
+FAKE_SYSTEMCTL = r'''#!/bin/sh
+# 测试桩 systemctl：调用全记录；对 cadence-relay@X 的 start/restart 真实
+# nohup $RELAY_RUN_SCRIPT，disable/stop 真实 kill（MainPID 语义与 systemd 一致）
+LOG=${SYSTEMCTL_LOG:?}; ST=${FAKE_STATE_DIR:?}
+echo "$*" >>"$LOG"
+cmd=$1; shift
+case $cmd in
+  is-system-running)
+    st=${FAKE_SYSTEMD_STATE:-running}; echo "$st"
+    case $st in running|degraded) exit 0 ;; *) exit 1 ;; esac ;;
+  daemon-reload) exit 0 ;;
+  enable)
+    [ -e "$ST/enable_fail" ] && exit 1
+    for u in "$@"; do
+      case $u in cadence-relay@*)
+        n=${u#cadence-relay@}; n=${n%%.service*}
+        d=$(dirname "$RELAY_UNIT_TEMPLATE")/multi-user.target.wants
+        mkdir -p "$d"
+        ln -sf "$RELAY_UNIT_TEMPLATE" "$d/cadence-relay@$n.service" ;;
+      esac
+    done
+    exit 0 ;;
+  restart|start)
+    [ -e "$ST/restart_fail" ] && exit 1
+    for u in "$@"; do
+      case $u in cadence-relay@*)
+        n=${u#cadence-relay@}; n=${n%%.service*}
+        if [ -f "$ST/$n.mainpid" ]; then
+          kill "$(cat "$ST/$n.mainpid")" 2>/dev/null; sleep 0.2
+        fi
+        nohup "$RELAY_RUN_SCRIPT" "$n" >>"$RELAY_LOG_FILE" 2>&1 &
+        echo $! >"$ST/$n.mainpid" ;;
+      esac
+    done
+    exit 0 ;;
+  disable|stop)
+    for u in "$@"; do
+      case $u in cadence-relay@*)
+        n=${u#cadence-relay@}; n=${n%%.service*}
+        if [ -f "$ST/$n.mainpid" ]; then
+          kill "$(cat "$ST/$n.mainpid")" 2>/dev/null
+          rm -f "$ST/$n.mainpid"
+        fi
+        rm -f "$(dirname "$RELAY_UNIT_TEMPLATE")/multi-user.target.wants/cadence-relay@$n.service" ;;
+      esac
+    done
+    exit 0 ;;
+  is-active)
+    for u in "$@"; do
+      case $u in cadence-relay@*)
+        n=${u#cadence-relay@}; n=${n%%.service*}
+        if [ -f "$ST/$n.mainpid" ] && kill -0 "$(cat "$ST/$n.mainpid")" 2>/dev/null; then
+          echo active; exit 0
+        fi ;;
+      esac
+    done
+    echo inactive; exit 3 ;;
+  is-enabled)
+    for u in "$@"; do
+      case $u in cadence-relay@*)
+        n=${u#cadence-relay@}; n=${n%%.service*}
+        if [ -e "$(dirname "$RELAY_UNIT_TEMPLATE")/multi-user.target.wants/cadence-relay@$n.service" ]; then
+          echo enabled; exit 0
+        fi ;;
+      esac
+    done
+    echo disabled; exit 1 ;;
+  show)
+    u=''; prop=''; prev=''
+    for a in "$@"; do
+      case $a in cadence-relay@*) u=$a ;; esac
+      [ "$prev" = "-p" ] && prop=$a
+      prev=$a
+    done
+    n=${u#cadence-relay@}; n=${n%%.service*}
+    if [ "$prop" = MainPID ] && [ -f "$ST/$n.mainpid" ]; then
+      cat "$ST/$n.mainpid"
+    else
+      echo 0
+    fi
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+'''
+
+# fake socat 不再用脚本桩：产品的 exe 身份核验（readlink /proc/<pid>/exe 的
+# basename 必须是 socat）要求沙箱 socat 是真实 ELF。做法：复制 coreutils
+# yes 二进制为 $bin/socat（任意参数常驻、TERM 可杀、argv 原样保留）。
+# 伪身份负例见 start_spoofed_listener（executable= 换 exe、伪装 argv[0]）。
+
+FAKE_IP = r'''#!/bin/sh
+echo "2: fake0    inet ${FAKE_BINDADDR:-127.0.0.1}/24 brd 10.89.255.255 scope global fake0"
+'''
+
+FAKE_DNF = r'''#!/bin/sh
+echo "dnf $*" >>"${DNF_LOG:?}"
+exit 0
+'''
+
+_can_run_vm = (
+    not sys.platform.startswith("win")
+    and shutil.which("bash") is not None
+    and Path("/proc").is_dir()
+    and shutil.which("yes") is not None
+)
+needs_vm = pytest.mark.skipif(
+    not _can_run_vm, reason="需要 POSIX bash、/proc 与 coreutils yes 执行 VM 侧行为验证"
+)
+
+
+class VmSandbox:
+    """POSIX 沙箱：bin 桩 + 沙箱路径环境变量，真实执行 devbox/relay-vm.sh。"""
+
+    def __init__(self, tmp_path, *, systemd_state="running",
+                 fake_bind="10.89.0.1", wsl_conf=None):
+        root = tmp_path / "vm"
+        self.bin = root / "bin"
+        self.unit_dir = root / "etc" / "systemd" / "system"
+        self.run_script = root / "app" / "cadence-relay-run"
+        self.boot_script = root / "app" / "cadence-relay-boot"
+        self.env_file = root / "etc" / "cadence-relay.env"
+        self.log_file = root / "var" / "cadence-relay.log"
+        self.wsl_conf = root / "etc" / "wsl.conf"
+        self.state_dir = root / "fake-systemd-state"
+        self.systemctl_log = root / "systemctl.log"
+        self.dnf_log = root / "dnf.log"
+        for d in (self.bin, self.unit_dir, self.run_script.parent,
+                  self.env_file.parent, self.log_file.parent, self.state_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        for name, body in (("ss", FAKE_SS), ("systemctl", FAKE_SYSTEMCTL),
+                           ("ip", FAKE_IP), ("dnf", FAKE_DNF)):
+            f = self.bin / name
+            f.write_text(body, encoding="utf-8")
+            f.chmod(0o755)
+        socat_bin = self.bin / "socat"
+        shutil.copy2(shutil.which("yes"), socat_bin)  # 真实 ELF：exe 核验可过
+        socat_bin.chmod(0o755)
+        if wsl_conf is not None:
+            self.wsl_conf.write_text(wsl_conf, encoding="utf-8")
+        # ELF 桩 socat（yes 副本）会满速写 stdout：全部日志重定向 /dev/null。
+        # relay-vm.sh 对 LOG_FILE 仅追加/末尾 rm -f（rm /dev/null 失败不中断，
+        # cmd_teardown 收尾是 log → 退出码仍 0），无文件内容断言，安全。
+        self.env = dict(
+            os.environ,
+            PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            RELAY_ENV_FILE=str(self.env_file),
+            RELAY_RUN_SCRIPT=str(self.run_script),
+            RELAY_BOOT_SCRIPT=str(self.boot_script),
+            RELAY_UNIT_TEMPLATE=str(self.unit_dir / "cadence-relay@.service"),
+            RELAY_LOG_FILE="/dev/null",
+            RELAY_WSL_CONF=str(self.wsl_conf),
+            SYSTEMCTL_LOG=str(self.systemctl_log),
+            FAKE_STATE_DIR=str(self.state_dir),
+            FAKE_SYSTEMD_STATE=systemd_state,
+            FAKE_BINDADDR=fake_bind,
+            DNF_LOG=str(self.dnf_log),
+        )
+        self._procs = []
+
+    def write_env(self, services):
+        """services: {name: (vmport, hostport)}；bind 固定写服务表值 VM_BIND
+        （fake_bind 只控制 fake ip 显示的网卡地址，用于网关漂移场景）。"""
+        self.env_file.write_text(
+            "".join(f"{n} {vp} {VM_BIND} {hp}\n"
+                    for n, (vp, hp) in services.items()),
+            encoding="utf-8")
+
+
+    def start_listener(self, listen_arg, target_arg):
+        """以 ELF socat 真实启动一个“前台 socat”进程（exe/argv 均真），返回 Popen。"""
+        p = subprocess.Popen(
+            [str(self.bin / "socat"), listen_arg, target_arg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._procs.append(p)
+        return p
+
+    def start_spoofed_listener(self, listen_arg, target_arg):
+        """伪身份占用者：argv 与服务表完全一致（argv[0]=socat），但 exe 换成
+        yes——产品的 /proc/<pid>/exe 核验必须把它拒绝为未知占用者。"""
+        p = subprocess.Popen(
+            ["socat", listen_arg, target_arg],
+            executable=shutil.which("yes"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._procs.append(p)
+        return p
+
+    def supervisor_pids(self):
+        """自有监督：exe 为 shell 解释器且完整 argv 恰为 [解释器, BOOT_SCRIPT]
+        两项（与 relay-vm.sh relay_supervisor_pids 同构；argv 仅“包含”路径
+        不足以判定——编辑器打开同一文件形态相同）。"""
+        pids = []
+        marker = str(self.boot_script)
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                exe = os.readlink(f"/proc/{entry.name}/exe")
+                args = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if Path(exe).name not in ("sh", "bash", "dash"):
+                continue
+            args = [a.decode("utf-8", "replace") for a in args if a]
+            if len(args) == 2 and args[1] == marker:
+                pids.append(int(entry.name))
+        return pids
+
+    def run(self, *args, timeout=120):
+        return subprocess.run(["bash", str(RELAY_VM), *args], env=self.env,
+                              capture_output=True, text=True, timeout=timeout)
+
+    def pids_on_port(self, vmport):
+        pids = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                args = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            for a in args:
+                a = a.decode("utf-8", "replace")
+                if a.startswith("TCP-LISTEN:"):
+                    if a[len("TCP-LISTEN:"):].split(",")[0] == str(vmport):
+                        pids.append(int(entry.name))
+                    break
+        return pids
+
+    def calls(self):
+        if not self.systemctl_log.exists():
+            return []
+        return [l for l in
+                self.systemctl_log.read_text(encoding="utf-8").splitlines() if l]
+
+    def dnf_calls(self):
+        if not self.dnf_log.exists():
+            return []
+        return self.dnf_log.read_text(encoding="utf-8").splitlines()
+
+    def mainpid(self, name):
+        f = self.state_dir / f"{name}.mainpid"
+        return int(f.read_text().strip()) if f.exists() else 0
+
+    def cleanup(self):
+        marker = str(self.bin / "socat").encode()
+        sup_pids = self.supervisor_pids()  # 收养自有监督（同构判定，防误杀编辑器形态）
+        for entry in Path("/proc").iterdir():  # 收养孤儿监听与 boot 监督进程
+            if not entry.name.isdigit():
+                continue
+            if int(entry.name) in sup_pids:
+                try:
+                    os.kill(int(entry.name), signal.SIGTERM)
+                except OSError:
+                    pass
+                continue
+            try:
+                cmd = (entry / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if marker in cmd:
+                try:
+                    os.kill(int(entry.name), signal.SIGTERM)
+                except OSError:
+                    pass
+        for f in self.state_dir.glob("*.mainpid"):
+            try:
+                os.kill(int(f.read_text().strip()), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        for p in self._procs:
+            if p.poll() is None:
+                p.terminate()
+        for p in self._procs:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+
+@pytest.fixture
+def vm_factory(tmp_path):
+    sandboxes = []
+
+    def make(**kw):
+        s = VmSandbox(tmp_path, **kw)
+        sandboxes.append(s)
+        return s
+
+    yield make
+    for s in sandboxes:
+        s.cleanup()
+
+
+VM_SVC = {"mysql": (45331, 47331), "redis": (45332, 47332)}
+VM_BIND = "10.89.0.1"
+
+
+def _listen_arg(name):
+    return f"TCP-LISTEN:{VM_SVC[name][0]},bind={VM_BIND},fork,reuseaddr"
+
+
+def _target_arg(name):
+    return f"TCP:127.0.0.1:{VM_SVC[name][1]}"
+
+
+def _wait_dead(p, timeout_s=8):
+    for _ in range(int(timeout_s * 10)):
+        if p.poll() is not None:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+@needs_vm
+def test_vm_setup_free_ports_writes_per_service_units(vm_factory):
+    """端口空闲：setup 成功，写每服务模板单元与 exec 型 run 脚本，真实拉起监听。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    r = vm.run("setup")
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (vm.unit_dir / "cadence-relay@.service").read_text(encoding="utf-8")
+    assert "StartLimitIntervalSec=0" in unit
+    assert "Restart=always" in unit and "RestartSec=5" in unit
+    assert f"ExecStart={vm.run_script} %i" in unit
+    run_text = vm.run_script.read_text(encoding="utf-8")
+    assert "command -v socat" in run_text, "socat 路径须运行时 command -v 动态解析"
+    assert 'exec "$SOCAT"' in run_text, "run 脚本必须 exec socat 前台（MainPID=监听进程）"
+    for name, (vp, _hp) in VM_SVC.items():
+        assert vm.pids_on_port(vp) == [vm.mainpid(name)], \
+            f"{name} 监听 pid 必须等于单元 MainPID"
+    calls = " ".join(vm.calls())
+    assert "enable cadence-relay@mysql" in calls
+    assert "enable cadence-relay@redis" in calls
+    assert "restart cadence-relay@mysql" in calls
+
+
+@needs_vm
+def test_vm_setup_exit3_without_force_keeps_listener(vm_factory):
+    """匹配的前台 socat 占用：无 --force 时 exit 3，进程不动，不写任何文件。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    p = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    r = vm.run("setup")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert p.poll() is None, "未确认前不得杀占用者"
+    assert not vm.run_script.exists()
+    assert not (vm.unit_dir / "cadence-relay@.service").exists()
+
+
+@needs_vm
+def test_vm_setup_force_rejects_unknown_listener(vm_factory):
+    """未知占用者（argv 对不上）：--force 也拒绝（exit 3），任何进程都不动。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    ok = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    bad = vm.start_listener(
+        f"TCP-LISTEN:{VM_SVC['redis'][0]},bind=192.0.2.9,fork,reuseaddr",
+        f"TCP:127.0.0.1:{VM_SVC['redis'][1] + 1}")
+    r = vm.run("setup", "--force")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert ok.poll() is None and bad.poll() is None, "未知占用者与匹配占用者都不能被杀"
+    assert not vm.run_script.exists(), "拒绝路径不得写任何文件"
+
+
+@needs_vm
+def test_vm_setup_force_takes_over_exact_match(vm_factory):
+    """--force：仅接管 argv 完全一致的前台 socat，监听转到 systemd 实例名下。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    p = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    old_pid = p.pid
+    r = vm.run("setup", "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _wait_dead(p), "被接管的前台 socat 必须退出"
+    pids = vm.pids_on_port(VM_SVC["mysql"][0])
+    assert pids and old_pid not in pids, "监听必须由 systemd 实例的新进程接管"
+    assert vm.mainpid("mysql") in pids
+    assert vm.mainpid("redis") in vm.pids_on_port(VM_SVC["redis"][0])
+
+
+@needs_vm
+def test_vm_setup_rollback_on_enable_failure(vm_factory):
+    """enable 失败：回滚——原监听按原命令行恢复，本次新建文件清空。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    p = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    (vm.state_dir / "enable_fail").write_text("", encoding="utf-8")
+    r = vm.run("setup", "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    for _ in range(80):
+        if vm.pids_on_port(VM_SVC["mysql"][0]):
+            break
+        time.sleep(0.1)
+    pids = vm.pids_on_port(VM_SVC["mysql"][0])
+    assert pids, "回滚必须以原命令行恢复接管前的监听"
+    assert p.pid not in pids, "恢复的必须是新进程（原前台窗口已不持有）"
+    assert not (vm.unit_dir / "cadence-relay@.service").exists(), "回滚须清理本次新建文件"
+    assert not vm.run_script.exists()
+
+
+@needs_vm
+def test_vm_setup_never_stops_when_systemd_unusable(vm_factory):
+    """systemd 不可用且 wsl.conf 有外来 [boot] 段：显式失败，占用者与文件零变动。"""
+    vm = vm_factory(systemd_state="offline", wsl_conf="[boot]\nsystemd=true\n")
+    vm.write_env(VM_SVC)
+    p = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    r = vm.run("setup", "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert p.poll() is None, "持久化方式未确定前不得动占用者"
+    assert not vm.run_script.exists()
+    conf = vm.wsl_conf.read_text(encoding="utf-8")
+    assert conf == "[boot]\nsystemd=true\n", "不得改动外来 wsl.conf"
+
+
+@needs_vm
+def test_vm_setup_boot_fallback_without_systemd(vm_factory):
+    """无 systemd：wsl.conf [boot] 兜底逐服务拉起，接管同样精确，不调 enable。"""
+    vm = vm_factory(systemd_state="offline", wsl_conf="")
+    vm.write_env(VM_SVC)
+    p = vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    r = vm.run("setup", "--force")
+    assert r.returncode == 0, r.stdout + r.stderr
+    conf = vm.wsl_conf.read_text(encoding="utf-8")
+    assert "cadence-relay-boot" in conf, "兜底钩子须写入 wsl.conf"
+    assert conf.count("[boot]") == 1, "wsl.conf 只保留一个钩子段（幂等）"
+    assert _wait_dead(p), "兜底路径同样只接管完全匹配的前台 socat"
+    for name, (vp, _hp) in VM_SVC.items():
+        assert vm.pids_on_port(vp), f"{name} 兜底监听必须存在"
+    assert all("enable" not in c for c in vm.calls()), "无 systemd 时不得调用 enable"
+
+
+@needs_vm
+def test_vm_status_reports_pid_bind_and_loopback(vm_factory):
+    """status：逐服务报告 MainPID=监听 pid、bind 在网卡、回环真实探活。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    assert vm.run("setup").returncode == 0
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", VM_SVC["mysql"][1]))
+    srv.listen(4)
+    try:
+        r = vm.run("status")
+        assert r.returncode == 1, "redis 回环无监听，整体须 FAIL"
+        assert "MainPID" in r.stdout
+        assert f"bind {VM_BIND} 在网卡上 OK" in r.stdout
+        assert f"回环 127.0.0.1:{VM_SVC['mysql'][1]} OK" in r.stdout
+        assert f"回环 127.0.0.1:{VM_SVC['redis'][1]} FAIL" in r.stdout
+    finally:
+        srv.close()
+
+
+@needs_vm
+def test_vm_status_flags_gateway_drift(vm_factory):
+    """bind 地址不在网卡上：status 明确提示 podman 网络重建、需重跑 setup。"""
+    vm = vm_factory(fake_bind="192.0.2.77")
+    vm.write_env(VM_SVC)
+    vm.start_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    r = vm.run("status")
+    assert "重跑 setup" in r.stdout, "网关漂移必须给出重跑指引"
+
+
+@needs_vm
+def test_vm_teardown_removes_only_own_artifacts(vm_factory):
+    """teardown：清自有 units/脚本/env/日志；不动未知监听、无关文件、socat 包。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    assert vm.run("setup").returncode == 0
+    other_unit = vm.unit_dir / "other-app.service"
+    other_unit.write_text("[Unit]\nDescription=unrelated\n", encoding="utf-8")
+    stranger = vm.start_listener(
+        f"TCP-LISTEN:{VM_SVC['redis'][0]},bind=192.0.2.5,fork,reuseaddr",
+        f"TCP:127.0.0.1:{VM_SVC['redis'][1]}")
+    r = vm.run("teardown")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert stranger.poll() is None, "未知监听必须保留"
+    assert other_unit.exists(), "无关 unit 文件必须保留"
+    assert not vm.env_file.exists()
+    assert not vm.run_script.exists()
+    assert not (vm.unit_dir / "cadence-relay@.service").exists()
+    calls = " ".join(vm.calls())
+    assert "disable --now cadence-relay@mysql" in calls
+    assert "disable --now cadence-relay@redis" in calls
+    assert vm.dnf_calls() == [], "socat 缺失时才可 dnf install，teardown 不得卸载"
+    assert vm.pids_on_port(VM_SVC["mysql"][0]) == []
+    assert stranger.pid in vm.pids_on_port(VM_SVC["redis"][0])
+
+
+@needs_vm
+def test_vm_teardown_tolerates_missing_env(vm_factory):
+    """env 已缺失：teardown 仍按 wants 链接停实例并清理其余自有文件。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    assert vm.run("setup").returncode == 0
+    vm.env_file.unlink()
+    r = vm.run("teardown")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not vm.run_script.exists()
+    assert not (vm.unit_dir / "cadence-relay@.service").exists()
+    for name, (vp, _hp) in VM_SVC.items():
+        assert vm.pids_on_port(vp) == [], f"{name} 实例监听须全部停止"
+
+
+@needs_vm
+def test_vm_setup_rejects_spoofed_exe(vm_factory):
+    """伪身份占用者（argv 完全一致但 exe 是 yes）：--force 也必须拒绝且不杀。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    p = vm.start_spoofed_listener(_listen_arg("mysql"), _target_arg("mysql"))
+    r = vm.run("setup", "--force")
+    assert r.returncode == 3, "exe 身份不符必须按未知占用者 exit 3 拒绝"
+    assert p.poll() is None, "伪身份进程不得被杀"
+    assert not vm.run_script.exists(), "拒绝路径不得写任何文件"
+
+
+@needs_vm
+def test_vm_read_env_rejects_duplicates(vm_factory):
+    """服务表重复服务名/重复 vmport：在任何写入前显式报错退出。"""
+    vm = vm_factory()
+    vm.env_file.write_text(
+        f"mysql {VM_SVC['mysql'][0]} {VM_BIND} 47331\n"
+        f"mysql {VM_SVC['redis'][0]} {VM_BIND} 47332\n",
+        encoding="utf-8")
+    r = vm.run("setup")
+    assert r.returncode == 1
+    assert "服务名重复" in r.stdout + r.stderr
+    vm.env_file.write_text(
+        f"mysql {VM_SVC['mysql'][0]} {VM_BIND} 47331\n"
+        f"redis {VM_SVC['mysql'][0]} {VM_BIND} 47332\n",
+        encoding="utf-8")
+    r2 = vm.run("setup")
+    assert r2.returncode == 1
+    assert "vmport 重复" in r2.stdout + r2.stderr
+    assert not vm.run_script.exists()
+
+
+@needs_vm
+def test_vm_setup_rollback_preserves_existing_units(vm_factory):
+    """已有两服务正常时重跑失败：事务回滚保住原 enabled/文件，不误停。
+    防假通过：必须证明原监听 pid 真被接管杀死、恢复的是新进程——
+    否则“原进程一直活着”也会让监听断言通过。"""
+    vm = vm_factory()
+    vm.write_env(VM_SVC)
+    assert vm.run("setup").returncode == 0
+    wants_mysql = (vm.unit_dir / "multi-user.target.wants"
+                   / "cadence-relay@mysql.service")
+    assert wants_mysql.exists()
+    old_pid = vm.pids_on_port(VM_SVC["mysql"][0])[0]
+    (vm.state_dir / "restart_fail").write_text("", encoding="utf-8")
+    r = vm.run("setup", "--force")
+    assert r.returncode == 1, r.stdout + r.stderr
+    calls = " ".join(vm.calls())
+    assert "disable" not in calls, "回滚不得取消原有 enabled"
+    assert wants_mysql.exists(), "回滚须保持原有 wants 链接（enabled）"
+    assert vm.run_script.exists(), "回滚须保留（还原）原有 run 脚本"
+    assert (vm.unit_dir / "cadence-relay@.service").exists()
+    try:
+        os.kill(old_pid, 0)
+        old_dead = False
+    except OSError:
+        old_dead = True
+    assert old_dead, "原监听必须被 --force 真实接管杀死（否则恢复断言无意义）"
+    pids = []
+    for _ in range(80):
+        pids = vm.pids_on_port(VM_SVC["mysql"][0])
+        if pids and old_pid not in pids:
+            break
+        time.sleep(0.1)
+    assert pids and old_pid not in pids, \
+        "回滚须以新进程恢复被接管监听（原 argv nohup）"
+
+
+@needs_vm
+def test_vm_boot_supervisor_restarts_listener(vm_factory):
+    """boot 兜底监督：监听进程死亡后在巡检周期内自动重拉（非 systemd 自恢复）。"""
+    vm = vm_factory(systemd_state="offline", wsl_conf="")
+    vm.write_env(VM_SVC)
+    assert vm.run("setup", "--force").returncode == 0
+    pids = vm.pids_on_port(VM_SVC["mysql"][0])
+    assert pids, "boot 模式监听须存在"
+    os.kill(pids[0], signal.SIGKILL)
+    back = False
+    for _ in range(120):  # 监督 5 秒巡检一轮，12 秒余量
+        new = vm.pids_on_port(VM_SVC["mysql"][0])
+        if new and pids[0] not in new:
+            back = True
+            break
+        time.sleep(0.1)
+    assert back, "监督须自动重拉死亡监听"
+
+
+@needs_vm
+def test_vm_teardown_kills_boot_supervisor(vm_factory):
+    """teardown 须先停 boot 监督循环再清监听，防止拆除后被重拉。"""
+    vm = vm_factory(systemd_state="offline", wsl_conf="")
+    vm.write_env(VM_SVC)
+    assert vm.run("setup", "--force").returncode == 0
+    assert vm.supervisor_pids(), "boot 模式须存在监督进程"
+    r = vm.run("teardown")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert vm.supervisor_pids() == [], "teardown 须停监督循环"
+    for name, (vp, _hp) in VM_SVC.items():
+        assert vm.pids_on_port(vp) == [], f"{name} 兜底监听须全部停止"

@@ -311,39 +311,75 @@ stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适�
 
 ### 2.6 连接你自己的远端中间件（VPN，Windows 专用）
 
-> 适用：中间件在**公司内网**、只能从 Windows 宿主经 VPN（如 aTrust）访问——容器直连 VPN 网段不通（VPN 丢弃一切 NAT 转发流量，实测定论）。基于 2026-10-09 真机验证链路产品化，完整设计见 OpenSpec `add-remote-middleware-relay`。
+> 适用：中间件在**公司内网**、只能从 Windows 宿主经 VPN（如 aTrust）访问——容器直连 VPN 网段不通（VPN 丢弃一切 NAT 转发流量，实测定论）。基于真机验证链路产品化，完整设计见 OpenSpec `add-remote-middleware-relay`。
+>
+> **状态（2026-10-14）**：链路已真机端到端验证（容器内 MySQL `SELECT 1` 返回 1、Redis `PING` 返回 `PONG`）；本手册交付的固化形态为**每服务一个 systemd 单元**（`cadence-relay@mysql`/`cadence-relay@redis`，单服务故障互不影响、开机自恢复）。**固化入口 = 交互 WSL 窗口直接执行 `relay-vm.sh`（见下；脚本本身的真机固化执行与验收 = OpenSpec tasks 1.4，尚未执行）**。`relay.ps1` 一键入口在维护者机存在「零输出 exit 0」问题（BOM/解析/提权已排除，根因未定），修复前勿依赖；其参数与 VM 脚本保持兼容，失败会显式报错而非静默。
 
-**前提**：Windows + Podman Desktop（WSL 后端，mirrored 网络）｜管理员 PowerShell（脚本自动 UAC 提权）｜VPN 已连｜stack 已启动（§2.4）。**不支持** macOS 与 Hyper-V 后端。
+#### 固化入口：交互 WSL 窗口（在已验证链路上执行，脚本待 1.4 真机验收）
 
-**一条命令拉通**（仓库根目录执行）：
+前提：Windows 侧 portproxy 已按服务表建好（127.0.0.1:13306/16379 → VPN 侧远端）、stack 已起（§2.4）、podman 网桥网关存在——`podman network inspect cadence_default` 查 `Gateway`（下例 10.89.0.1，按实际替换）。
+
+第 1 步：Windows 终端进入 VM 交互 root 窗口（非交互 `systemctl` 会报 Transport 错，必须交互进）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1
+wsl -d podman-machine-default -u root
 ```
 
-- 首次运行问答输入远端地址（`IP:端口`，如 `10.129.12.75:3306`；域名暂不支持）；也可参数直传 `-MySQL 10.129.12.75:3306 -Redis 10.x.x.x:6379`
-- 配置留痕 `<安装目录>\relay.json`：重跑回显旧值、回车保留；改地址重跑即生效
-- 存量安装目录（非仓库旁 `cadence`，如早期 `-InstallDir D:\testpodman\cadence`）：
-  `-Status`/`-Teardown` 也要带同一 `-InstallDir`，`relay.json` 位置不变、无需迁移
-- 完成后打印容器内应用应使用的连接地址：
+第 2 步：VM 窗口内（提示 getcwd 错误先执行 `cd /root`）。先拿到更新后的脚本——仓库在 Windows 磁盘时经 `/mnt/c` 直读，否则在 Windows 侧 `podman machine cp .\devbox\relay-vm.sh podman-machine-default:/root/relay-vm.sh` 后用 `/root/relay-vm.sh`。设变量并写服务表两行（服务名与端口不得重复）：
+
+```bash
+S=/mnt/c/path/to/Cadence-devbox/devbox/relay-vm.sh
+printf '%s\n' 'mysql 23306 10.89.0.1 13306' 'redis 26379 10.89.0.1 16379' > /etc/cadence-relay.env
+```
+
+第 3 步：先试运行（预期 exit 3 并列出「可接管」的前台监听），确认后再接管：
+
+```bash
+bash "$S" setup          # 端口被前台 socat 占用时 exit 3，列占用者
+bash "$S" setup --force  # 精确接管：仅 exe+argv 与服务表完全一致的监听
+```
+
+`--force` 接管规则（双重身份核验）：`readlink /proc/<pid>/exe` 必须是 socat 本体，且按 NUL 边界读取的完整命令行恰为三参（socat + `TCP-LISTEN:<vmport>,bind=<bindaddr>,fork,reuseaddr` + `TCP:127.0.0.1:<hostport>`），kill 前重核；argv 伪装（exe 不符）、任何归属其它 systemd unit 的占用者一律拒绝（不杀不停不删，exit 3）。接管会断开现有连接（约 1-5 秒空档），请在空闲时明确执行。setup 为事务式：写入前快照被覆盖文件与各实例 enabled/active 状态，任一步失败按快照回滚（还原文件、恢复原实例状态、按原命令行恢复被接管监听），不卸载 socat 包。旧版 `cadence-relay.service` 单元会在所有权核验后安全迁移，非本方案同名文件则拒绝。
+
+第 4 步：验证。VM 侧 `status` 报告每服务 systemd 单元 active、监听 pid=MainPID、bind 在网卡、回环 portproxy 一跳；再从容器内实测：
+
+```bash
+bash "$S" status
+```
+
+```powershell
+podman exec devbox mysql -h 10.89.0.1 -P 23306 -u root -p -e "SELECT 1"
+podman exec devbox redis-cli -h 10.89.0.1 -p 26379 --askpass PING
+```
+
+固化结果：每服务 `cadence-relay@<name>.service`（`Restart=always`+`RestartSec=5`+`StartLimitIntervalSec=0`：开机网桥未就绪时每 5 秒自动重试直到绑定成功）。宿主/WSL 重启后无需人工干预；podman 网络重建导致网关漂移时 `status` 会明确提示重跑 setup 重绑。
+
+拆除（VM 侧，只清自有痕迹：单元/模板/脚本/服务表/日志/boot 钩子；**不动** socat 包、未知监听与 Windows 侧 portproxy）：
+
+```bash
+bash "$S" teardown
+```
+
+#### 一键入口 relay.ps1（问题未定，暂勿依赖）
+
+维护者机实测存在零输出退出问题（根因未定，调查暂停）；修复并真机验收前，请用上面的交互 WSL 路线。原命令与行为契约保留（其 setup/status/teardown 与 VM 脚本参数兼容；占用时 exit 3、确认后 `--force`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1            # setup
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status    # 逐跳体检
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称拆除
+```
+
+配置留痕 `<安装目录>\relay.json`（重跑回显旧值、回车保留）；完成后打印容器内应用应使用的连接地址：
 
 ```text
 mysql → 10.89.0.1:23306      # podman 网桥网关，稳定，不随宿主 DHCP 变化
 redis → 10.89.0.1:26379
 ```
 
-**链路**（4 跳，全自动搭建与验证）：容器 → VM socat（绑网桥网关）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；重启自动恢复（systemd 优先，wsl.conf 钩子兜底）。
+**链路**（4 跳）：容器 → VM socat（绑网桥网关，每服务一个 systemd 单元）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；VM 侧 systemd 优先（`Restart=always` 自恢复），wsl.conf [boot] 兜底为 5 秒巡检的监督循环（等价自恢复；存在外来 [boot] 段时显式失败）。
 
-**日常**：
-
-```powershell
-# 逐跳体检：portproxy / VM 监听 / 容器可达 / 远端可达；VPN 掉线会明确提示
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status
-# 对称拆除（含确认清单），恢复到通道建立前
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown
-```
-
-**注意**：VPN 断开则应用连不上（预期行为，`-Status` 可区分）；端口与 stack 自带中间件错开（本地 13306/16379、容器侧 23306/26379 vs stack 的 3306/6379），两套并存互不影响；检测到存量手搭中继占用端口时先征求确认再接管。平台守卫按官方 `podman machine list --format json` 的 `VMType`/`Running` 判定 WSL 后端与运行状态（`machine inspect` 输出无 `Provider` 字段，勿用 `--format "{{.Provider}}"`）；一切失败均以红字带 podman 原始报错文本退出（exit 1），不会静默——双击直接运行时窗口会停住等回车再关。
+**注意**：VPN 断开则应用连不上（预期行为，status 可区分「VPN 未连」与「中继故障」）；端口与 stack 自带中间件错开（本地 13306/16379、容器侧 23306/26379 vs stack 的 3306/6379），两套并存互不影响；存量手搭中继占用端口时先 exit 3 报占用者、确认后仅精确接管。VM 侧 teardown 不删 Windows portproxy 规则（如需删除在 Windows 侧 `netsh interface portproxy delete v4tov4 listenport=13306` 等按端口精确删除）。
 
 ## 3. 日常使用
 

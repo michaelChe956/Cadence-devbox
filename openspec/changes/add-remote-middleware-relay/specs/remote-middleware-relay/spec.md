@@ -14,9 +14,13 @@
 - **WHEN** 用户在已安装 devbox 的 Windows 宿主以管理员运行 setup，提供 mysql=10.129.12.75:3306、redis=10.129.20.31:6379
 - **THEN** 两侧中继建成，脚本从 devbox 容器内对网桥网关 23306/26379 做 TCP 探活全部通过，并打印形如 `mysql → 10.89.0.1:23306`、`redis → 10.89.0.1:26379` 的连接信息（podman 网桥网关，动态发现）
 
-#### Scenario: 重复运行幂等
-- **WHEN** 用户对同一配置再次运行 setup
-- **THEN** 不产生重复的 portproxy 规则、中继进程或开机钩子，最终状态与首次运行后一致
+#### Scenario: 单服务故障互不影响
+- **WHEN** 两个中继服务已建成且某服务实例异常退出（如 redis 中继被 kill）
+- **THEN** 该服务实例在 5 秒内自动重启恢复监听，另一服务（mysql）的监听进程不受影响（每服务独立 systemd 实例）
+
+#### Scenario: 网关漂移后提示重跑
+- **WHEN** podman 网络重建导致网桥网关地址变化后运行 status
+- **THEN** 报告 bind 地址不在本机网卡并明确提示重跑 setup 重绑，而不是笼统的监听失败
 
 #### Scenario: 宿主 IP 变化不影响通道
 - **WHEN** Windows 网卡 IP 因 DHCP 发生变化
@@ -29,6 +33,10 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 #### Scenario: 端口被手搭中继占用
 - **WHEN** VM 内网桥网关的 23306 已被名为 socat-mysql-relay 的手搭 systemd 服务监听时运行 setup
 - **THEN** 脚本报告占用者与处理路径，用户确认拆除后 setup 接管该端口并正常完成
+
+#### Scenario: --force 仅精确接管完全一致的监听
+- **WHEN** 配置端口的占用者为命令行参数（bind+port+target）与服务表行完全一致、且 `/proc/<pid>/exe` 为 socat 本体的前台 socat，用户带 `--force` 运行 setup
+- **THEN** 仅该 socat 进程被接管（kill 前重核身份，随后由本方案 systemd 实例重建监听），其余进程与 unit 一律不动；exe 不符的 argv 伪装者、或归属任何其它 systemd unit 的占用者，`--force` 也拒绝（exit 3），什么都不动
 
 ### Requirement: 交互式配置与留痕
 
@@ -56,7 +64,7 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 
 ### Requirement: 对称拆除
 
-`-Teardown` MUST 移除本脚本创建的全部痕迹（portproxy 规则、VM 内脚本、开机钩子、socat 软件包、配置文件），且 MUST 不删除配置留痕之外的宿主网络配置（如用户或 IT 手工创建的 portproxy）。
+`-Teardown` MUST 移除本脚本创建的全部痕迹（portproxy 规则、VM 内 systemd 单元（模板+实例）与脚本、开机钩子、服务表与日志、配置文件），且 MUST 不删除配置留痕之外的宿主网络配置（如用户或 IT 手工创建的 portproxy）与本方案边界之外的资源（未知监听进程、socat 软件包——2026-10-14 修订：包可能被其它用途共享，保留并在拆除输出中说明）。
 
 #### Scenario: 拆除后回到初始状态
 - **WHEN** 用户运行 `-Teardown`

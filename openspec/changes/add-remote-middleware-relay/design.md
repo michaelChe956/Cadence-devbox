@@ -2,11 +2,11 @@
 
 ## Context
 
-链路已于 2026-10-08/09 在维护者 Windows 真机（Podman Desktop + WSL 后端 + mirrored 网络 + 宿主 VPN）完整验证：容器 → VM socat(23306) → WSL mirrored 回环 127.0.0.1:13306 → Windows netsh portproxy → VPN → 远端 MySQL，端到端 `SELECT 1` 通过。实测约束（设计输入）：
+链路已于 2026-10-08/09 在维护者 Windows 真机（Podman Desktop + WSL 后端 + mirrored 网络 + 宿主 VPN）完整验证：容器 → VM socat(23306) → WSL mirrored 回环 127.0.0.1:13306 → Windows netsh portproxy → VPN → 远端 MySQL，端到端 `SELECT 1` 通过。2026-10-14 端到端复验（容器内 MySQL `SELECT 1` 返回 1、Redis 认证 `PING` 返回 `PONG`）并按「每服务一个 systemd 模板实例」交付固化实现；脚本本身的真机固化执行与验收 = tasks 1.4（待办，未声称已验证）。实测约束（设计输入）：
 
 - aTrust VPN 静默丢弃一切 NAT 转发流量，仅 Windows 本机进程发出的流量走隧道（2026-09-28/10-09 排查定论）——任何方案最后一跳必须由 Windows 本机发起，portproxy 是唯一入口
 - mirrored 模式下 VM 的 `127.0.0.1` 可达 Windows 的 loopback 监听（实测 M_OK）；但镜像模式不把打到 Windows 自有 IP 的连接转交给 Windows 进程（一律 refused，实测）——容器侧必须由 VM 自建监听做中继
-- VM 的 systemd 可用，但非交互调用受限：一次性 `wsl -u root systemctl ...` 报 `Transport endpoint is not connected`，交互式进入后正常（2026-10-09 实测）；`podman machine ssh` 路径可行性待实施时验证
+- WSL 嵌套命名空间下 systemd running，但交互式 `wsl -d podman-machine-default -u root` 进入后 systemctl 全部可用；一次性 `wsl -u root systemctl ...` 报 `Transport endpoint is not connected`（2026-10-09/10-14 实测）——固化交付走交互窗口，不经非交互链路
 - PowerShell → wsl → sudo 多层引号会拆坏长复合命令（实测静默失败）；install.ps1 已确立"cp 文件进 VM 再 ssh 执行"的规避模式
 - 用户终端粘贴超约 120 字符的行会被折行截断；面向用户输出的命令每行 ≤100 字符，PowerShell 块用 @() 数组而非 here-string（实测教训）
 
@@ -35,13 +35,21 @@
 
 `devbox/relay-vm.sh`（子命令 setup/status/teardown，ShellCheck 覆盖）负责 VM 内一切：dnf 装 socat、写 `/etc/cadence-relay.env`、管理 systemd 服务（或兜底 wsl.conf 钩子）、按配置端口启停监听。全程不使用内嵌长命令字符串（规避引号拆坏，install.ps1 同款教训）。
 
-### D3. 持久化：systemd 优先，boot 钩子兜底
+### D3. 持久化：每服务 systemd 模板实例，boot 钩子兜底（2026-10-14 修订）
 
-首选 VM 内 systemd 服务（cadence-relay 前缀命名，`Restart=always` + `RestartSec=5`：网桥未就绪时绑定失败自动重试直到成功——维护者手搭链已验证此自愈模式）。实施时先验证 `podman machine ssh sudo systemctl enable --now` 是否可用；不可用则回退 `/etc/wsl.conf` [boot] 钩子（启动脚本带重试循环）。VM 内文件布局：`/etc/cadence-relay.env`（服务表：每行 `vm端口=127.0.0.1:portproxy端口`）+ 按表拉起的监听进程 + 日志 `/var/log/cadence-relay.log`。重启逻辑幂等：先按配置端口 pkill 旧监听再拉起；wsl.conf 管理（兜底路径）：移除含 cadence-relay-boot 的既有行后追加，保留其他 section。
+VM 侧每个服务一个 systemd 模板实例 `cadence-relay@<name>.service`：`ExecStart=/usr/local/bin/cadence-relay-run %i`，run 脚本按服务名查 `/etc/cadence-relay.env` 后 `exec socat`（前台，MainPID 即监听进程）；单元配 `Restart=always` + `RestartSec=5` + `StartLimitIntervalSec=0`（[Unit] 段）——开机网桥未就绪时绑定失败每 5 秒自动重试直到成功，且单服务故障互不影响（取代 v1 的单 unit + run 脚本内 pkill 重试循环：旧方案一个 socat 挂掉后无人拉起、端口级 pkill 会误杀无关进程）。
+
+setup 顺序（任何停止/接管之前完成全部校验）：读服务表（服务名限 `[A-Za-z0-9_-]`；**服务名与 vmport 重复即拒绝**，防第二行静默失配）→ 工具检查（ss/socat/dnf）→ bind 地址在本机网卡（网桥漂移即显式失败）→ systemd 可用性（`is-system-running`；不可用回退 wsl.conf [boot] 兜底，存在外来 `[boot]` 段则显式失败）→ 只读占用分析 → **事务快照**（被覆盖文件备份 + 各实例 enabled/active 状态）→ 写文件 → 旧版 `cadence-relay.service` 安全迁移（Description 所有权核验通过才停用移除，非本方案同名文件拒绝）→ 精确接管（kill 前重核身份）→ enable+restart → 逐服务验证监听。失败按快照事务回滚：disable 仅本轮新启实例、还原被覆盖文件、恢复原实例 enabled/active（restart 原监听）、按原命令行恢复被接管监听；不卸载 socat 包。
+
+精确接管（取代 v1 的 kill_port/pkill -f）：双重身份核验——`readlink /proc/<pid>/exe` 的 basename 必须是 socat（exe 内核级身份，argv 伪造无效），且按 NUL 边界读取的完整 argv 恰为三参（socat + `TCP-LISTEN:<vmport>,bind=<bindaddr>,fork,reuseaddr` + `TCP:127.0.0.1:<hostport>`；额外选项/地址均判不一致），kill 前重核 pid 身份。占用者归属任何非本方案 systemd unit（如 socat-mysql-relay）时一律 exit 3 拒绝，不杀不停不删（本方案自有实例/旧版单 unit 除外，走 enable+restart 幂等收敛）。接管有 1-5 秒空档、会断现有连接（文档要求用户空闲时明确执行）；已建立连接的 fork 子进程随断连退出，不在本方案进程树清理范围（既有边界）。
+
+boot 兜底（systemd 不可用时）：`/usr/local/bin/cadence-relay-boot` 为监督循环——每 5 秒按服务表巡检，监听消失即重拉对应 run 脚本（等价 `Restart=always` 的自恢复，含开机网桥晚就绪场景）；监督进程身份（argv 含 BOOT_SCRIPT 路径）可被 setup/teardown 精确停止，禁止双监督竞拉。
+
+交付路线（用户在已验证链路上执行；tasks 1.4 为真机固化验收项）：用户在交互 root WSL 窗口（`wsl -d podman-machine-default -u root`）手工写两行服务表 env 后直接跑 `relay-vm.sh setup`/`setup --force`；不经 relay.ps1、不经非交互 systemctl（Transport 错，见 Context）。podman 网络重建导致网关漂移：status 检测 bind 不在网卡即提示重跑 setup 重绑（监听仍指向旧网桥，必须重跑）。
 
 ### D4. 配置留痕与拆除安全
 
-配置存 `<InstallDir>/relay.json`（与 cadence-box.yaml 同目录，进安装器写好的本地 .gitignore 防误提交）：`{"version":1,"services":[{"name":"mysql","remoteHost":"10.x.x.x","remotePort":3306,"hostPort":13306,"vmPort":23306},...]}`。`-Teardown` 只删：配置中记录的端口对应的 portproxy 规则、`cadence-relay` 前缀的 VM 文件与 boot 钩子行、socat 包、relay.json 本体。用户/IT 手工创建的其他 portproxy 规则不动（按端口精确匹配）。teardown 前回显将删除项并二次确认。
+配置存 `<InstallDir>/relay.json`（与 cadence-box.yaml 同目录，进安装器写好的本地 .gitignore 防误提交）：`{"version":1,"services":[{"name":"mysql","remoteHost":"10.x.x.x","remotePort":3306,"hostPort":13306,"vmPort":23306},...]}`。`-Teardown` 只删：配置中记录的端口对应的 portproxy 规则、VM 侧自有痕迹（cadence-relay@ 实例与模板、run/boot 脚本、服务表、日志、boot 钩子行）、relay.json 本体。**socat 包保留不卸**（2026-10-14 修订：包可能被其它用途共享，卸载超出"本脚本创建的痕迹"边界；teardown 输出明确说明未动项）。用户/IT 手工创建的其他 portproxy 规则与未知监听不动（按端口/argv 精确匹配）。teardown 前回显将删除项并二次确认。
 
 ### D5. 前置自检与顺序
 
@@ -53,12 +61,17 @@ setup 执行顺序固定：平台守卫（`podman machine inspect` Provider 必�
 
 ## Risks / Trade-offs
 
+- [接管 1-5 秒空档断现有连接] → 属 `--force` 的固有代价；先以不带 --force 的 setup 列出"可接管"清单，用户空闲时明确执行；失败回滚按原命令行恢复监听（原前台窗口不再持有进程，以 nohup 方式恢复）
+- [被接管 socat 的 fork 子进程残留] → kill 监听主 pid 后子连接进程随断连退出；验证阶段若监听未按期出现则整体回滚
+- [维护者机已有 0.0.0.0:13306 的 portproxy 规则把 MySQL 暴露到局域网] → 与 D1"仅 127.0.0.1"冲突但属用户自建规则，本方案不动（D4 边界）；文档与交付说明中明确提醒用户自行处理
+- [重启后 systemd 能否拉起 enabled 实例] → 交互窗口内 is-system-running=running 支持该推断，但未做重启实测；留给真机验收 5.1（重启 Windows 后容器内探活）
+- [is-system-running 返回 starting/degraded 以外状态时走 wsl.conf 兜底，而机器 wsl.conf 已有 [boot] 段会显式失败] → 显式失败而非静默；提示改走交互 systemd 路线
 - [WSL/Podman 更新改变 mirrored 回环行为] → `-Status` 逐跳定位把"哪一跳坏了"变成一句话结论；README 记录依赖前提
 - [VPN 掉线导致通道不可用] → 属预期；前置自检与 status 的差异化提示让用户能自行判断
-- [podman 网络重建导致网桥网关漂移] → 每次运行动态发现网关（podman network inspect），不硬编码；漂移后重跑 setup 重绑
-- [弱技术用户误删/误拆] → teardown 二次确认 + 回显清单
+- [podman 网络重建导致网桥网关漂移] → 每次运行动态发现网关（podman network inspect），不硬编码；VM 侧 status 检测 bind 不在网卡即提示重跑 setup 重绑
+- [弱技术用户误删/误拆] → teardown 二次确认 + 回显清单；VM 侧 teardown 不动未知监听/socat 包/portproxy
 - [端口与 stack 自带中间件冲突] → 固定错开（13306/16379 vs 3306/6379），测试断言无重叠
-- [存量手搭中继占用端口] → setup 前置检测监听占用，识别占用者并引导拆除或由脚本接管（维护者机的 socat-mysql-relay 即实例）
+- [存量手搭中继占用端口] → setup 只读占用分析：argv 完全一致才可在 --force 下精确接管，未知占用者 exit 3 报告并拒绝（维护者机的两个前台 socat 即实例，已按此规则接管固化）
 
 ## Migration Plan
 
