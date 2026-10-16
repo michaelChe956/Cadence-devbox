@@ -47,7 +47,7 @@ Description 匹配的自有 `cadence-relay@*` 才 disable --now + 清链接；�
 改名/重推导端口后旧实例先腾出新端口）。**boot 兜底模式**（无 systemd，socat
 由监督 nohup 拉起、非 systemd 实例）下由 `setup --retire <旧服务表>` 对账回收
 （relay.ps1 每次渲染旧表文件，无变更则仅表头）：对旧 vmport 上 is_expected_socat
-三参核验一致的自有监听精确 kill，未知不动；systemd 模式下该对账为幂等 no-op；
+三参核验一致的自有监听精确 kill，未知不动；systemd 模式下删服务场景为幂等 no-op（recycle 已先行停实例），同名换端口场景会提前终止该实例 MainPID，由 Restart=always 在 5 秒内自恢复并绑新端口、⑥ 再 restart，收敛语义不变；
 对账 bind 用当前网关，网关漂移时旧监听 argv 对不上会被显式跳过（评审 P3 补）。
 
 ### D3. 持久化：每服务 systemd 模板实例，boot 钩子兜底（2026-10-14 修订）
