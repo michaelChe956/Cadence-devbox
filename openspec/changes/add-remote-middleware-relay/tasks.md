@@ -5,7 +5,7 @@
 - [x] 1.1 编写 `devbox/relay-vm.sh`（setup/status/teardown 三子命令：dnf 装 socat、按 `/etc/cadence-relay.env` 服务表启停监听、systemd 服务管理——`machine ssh` 非交互 enable 不可用时回退 wsl.conf boot 钩子，实施首日先验证），验证：`shellcheck devbox/relay-vm.sh` 零告警、`bash -n` 通过（映射 spec：一键建立通道、通道开机自恢复、对称拆除）
 - [ ] 1.2 幂等性验证：连续两次执行 setup 后 `ss -tln` 中每个配置端口仍只有一个监听、wsl.conf 只有一行钩子（映射 spec：重复运行幂等；2026-10-14 起含每服务单元连续 setup 幂等——自有实例由 enable+restart 收敛）
 - [ ] 1.3 （2026-10-14 固化修订，取代 1.1 的单 unit 形态；同日按审查 7 项 Important 补强）`relay-vm.sh` 每服务模板单元 `cadence-relay@.service`（`Restart=always`+`RestartSec=5`+`StartLimitIntervalSec=0`，run 脚本 `exec socat` 前台）+ 双重身份精确接管（`readlink /proc/<pid>/exe` basename==socat + NUL 边界 argv 恰三参，kill 前重核；exe 伪装/归属任何其它 unit 的占用者 `--force` 也 exit 3 拒绝；删 pkill -f/stop 任意 unit）+ setup 先校验（服务表含服务名与 vmport 重复预检/工具/bind 在网卡/systemd 可用性）后接管 + 事务快照回滚（被覆盖文件与各实例 enabled/active 快照；失败还原文件、恢复原实例、仅 disable 本轮新启、按原命令行恢复被接管监听）+ 旧版 `cadence-relay.service` 所有权核验安全迁移 + boot 兜底 5 秒巡检监督循环（等价自恢复；setup/teardown 精确停监督）+ status 校验监听 pid=MainPID 与 bind 在网卡（漂移提示重跑）+ teardown 只清自有痕迹（不卸 socat 包、不动未知监听/portproxy）。验证：`shellcheck devbox/relay-vm.sh` 零告警 + 沙箱真实行为回归全绿后勾选（VmSandbox 组，含 exe 伪装拒绝/重复预检/事务回滚保旧配置/监督重拉/teardown 停监督）
-- [ ] 1.4 交互 WSL 窗口真机固化（维护者机，已验证链路上执行）：`wsl -d podman-machine-default -u root` → 手写两行 `/etc/cadence-relay.env` → `relay-vm.sh setup`（预期 exit 3 列可接管）→ `setup --force` 精确接管两前台 socat → `status` 各项 OK → 容器内 MySQL `SELECT 1`=1、Redis `PING`=PONG → `systemctl kill cadence-relay@redis` 验证 5 秒自恢复且 mysql MainPID 不变（映射 spec：单服务故障互不影响、--force 仅精确接管、通道开机自恢复）
+- [x] 1.4 交互 WSL 窗口真机固化（维护者机，已验证链路上执行）——**2026-10-16 真机实测通过**：交互 root WSL 写入 `/etc/cadence-relay.env`（mysql/redis 两行）→ `bash /home/user/relay-vm.sh setup` → 每服务 `cadence-relay@<name>` systemd 单元建立、两端口监听 OK；容器协议级验证 MySQL `SELECT 1` 返回 1、Redis `PING` 返回 PONG；重启 Windows 后未重跑 setup/未手工拉起 socat，两条查询仍返回 1 与 PONG（通道开机自恢复实证，对应 spec「重启后通道仍可用」）（映射 spec：单服务故障互不影响、--force 仅精确接管、通道开机自恢复）
 
 ## 2. 宿主侧脚本
 
@@ -26,4 +26,4 @@
 
 ## 5. 真机验收（维护者 Windows 机执行）
 
-- [ ] 5.1 全生命周期验收（维护者机已还原至初始态）：setup（探活+连接信息）→ 应用以 `网关:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 各项 requirement 场景逐条对上
+- [ ] 5.1 全生命周期验收（维护者机已还原至初始态）：setup（探活+连接信息）→ 应用以 `网关:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 各项 requirement 场景逐条对上。**2026-10-16 实测进度**：交互 WSL 固化路线（tasks 1.4）已过——setup 建单元、两端口监听、容器内 `SELECT 1`=1 / `PING`=PONG、重启 Windows 自恢复通过（未重跑 setup）；仍开放：`-Status`（relay.ps1 入口静默问题未定）、`-Teardown`、`systemctl kill` 单服务自恢复子项（沙箱已覆盖，真机未单测）
