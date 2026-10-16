@@ -40,11 +40,27 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 
 ### Requirement: 交互式配置与留痕
 
-首跑 MUST 以问答收集中间件远端地址并保存到安装目录的配置文件；重跑 MUST 回显已有值并允许直接回车保留或输入新值；MUST 同时支持命令行参数覆盖问答。
+首跑 MUST 以问答收集中间件远端地址并保存到安装目录的配置文件；重跑 MUST 回显已有通道（编号）并允许保留/删除/新增；MUST 同时支持命令行参数覆盖问答。服务清单 MUST 为动态长度：新增服务从目录（mysql/redis/kafka/zookeeper/rabbitmq）多选或走自定义（服务名+IP:端口）；通道端口 MUST 按远端端口推导（hostPort=+10000、vmPort=+20000），与存量 mysql/redis 通道值保持不变；推导命中本地 stack 发布端口时 MUST 显式拒绝。
 
 #### Scenario: 修改远端地址
-- **WHEN** 用户重跑 setup 并将 mysql 远端地址改为新值
-- **THEN** 配置文件更新，portproxy 目标与中继随之刷新，旧目标不再残留
+- **WHEN** 用户重跑 setup 并将 mysql 远端地址改为新值（远端端口随之变化）
+- **THEN** 配置文件更新，portproxy 目标与中继随之刷新，旧端口的 portproxy 规则与 VM 监听一并清除，旧目标不再残留
+
+#### Scenario: 新增目录服务并按远端端口推导
+- **WHEN** 用户重跑 setup，保留已有 mysql/redis 并新增目录项 kafka=10.129.30.8:9092
+- **THEN** kafka 通道端口按远端端口推导（hostPort=19092、vmPort=29092），relay.json 记录三项服务，连接信息打印 kafka → 网关:29092
+
+#### Scenario: 目录外自定义服务
+- **WHEN** 用户以自定义项新增服务 es7=10.129.30.9:9200（服务名限字母数字与 _-）
+- **THEN** 以服务名 es7 建立通道（hostPort=19200、vmPort=29200），VM 侧 systemd 实例名为 cadence-relay@es7
+
+#### Scenario: 推导端口撞本地 stack 时显式拒绝
+- **WHEN** 新增远端 rabbitmq 地址端口为 5672（推导 hostPort=15672 与本地 stack 发布的 15672 重叠）
+- **THEN** setup 显式报错说明重叠原因，不创建任何 portproxy 或 VM 内文件
+
+#### Scenario: 重跑 setup 删除服务
+- **WHEN** 已有 mysql/redis 通道，重跑 setup 时仅保留 mysql（redis 被删除）
+- **THEN** Windows 侧 redis 的 portproxy 规则被删除；VM 侧 systemd 实例被本次 setup 回收（停监听、清 wants 链接），无 systemd 的 boot 兜底模式下其 socat 监听由 setup 按旧服务表对账回收（三参核验，未知不动）；mysql 通道不受影响
 
 ### Requirement: 通道开机自恢复
 

@@ -16,16 +16,13 @@
 
 ## Decisions
 
-### D1. 两跳中继 + 固定端口表
+### D1. 两跳中继 + 端口推导规则（2026-10-16 修订：固定端口表 → 目录 + 推导）
 
 每个服务两跳：Windows `netsh portproxy`（仅监听 `127.0.0.1`，经 mirrored 回环被 VM 使用，不暴露局域网）+ VM 内 socat（仅绑定 podman 网桥网关地址——只有容器网段可达；网关地址经 `podman network inspect` 动态发现，不硬编码）。
 
-服务端口表（v1）：
+端口推导（用户 2026-10-16 裁决，与存量通道向后兼容）：`hostPort = remotePort + 10000`、`vmPort = remotePort + 20000`，remotePort 合法范围 [1, 45535]（上限 45535+20000 恰为 65535，vmPort 不越界；评审修正：初版误写 46535——那是 hostPort 的边界，vmPort 会算出 66535）。存量锚点：mysql 3306→13306/23306、redis 6379→16379/26379 与 v1 固定表一致，旧 relay.json 保留值无需迁移（保留项沿用旧值，不重新推导）。推导值恒 ≥10001，与 stack 自带发布端口（3306/6379/5672/15672/9000/9001/3000/8080）零重叠——经全域枚举核实存在唯一撞点：远端 rabbitmq 5672 → hostPort 15672 撞本地 rabbitmq 管理台。处置：`Get-RelayPorts` 内置 stack 发布端口清单（与 compose.yaml 一致，测试断言），推导命中即显式拒绝并说明原因（远端须换非 5672 端口）；测试钉住 5672 必拒、45535 通过/45536 拒绝、目录其余项零重叠。
 
-| 服务 | portproxy 监听 | VM 中继监听 | 远端（示例） |
-|---|---|---|---|
-| mysql | 127.0.0.1:13306 | 网关:23306 | VPN 网段 IP:3306 |
-| redis | 127.0.0.1:16379 | 网关:26379 | VPN 网段 IP:6379 |
+服务目录（新增服务的选择面，值为常见远端端口、仅作问答示例提示）：mysql(3306)、redis(6379)、kafka(9092)、zookeeper(2181)、rabbitmq(5672)；目录外走 `custom` 自定义（服务名限 `[A-Za-z0-9_-]`，与 systemd 实例名约束一致 + IP:端口）。不同服务推导出相同 host/vm 端口（同远端端口）在问答合并后统一预检拒绝。
 
 备选否决：单跳（VM 直连远端）——实测不通；中继做成 compose 服务（`network_mode: host`）——依赖 podman-compose 的 host 网络行为且把宿主网络工具混入容器 stack 体系，持久化也弱于 boot 钩子。
 
@@ -34,6 +31,24 @@
 `devbox/relay.ps1`（用户入口：setup 默认 / `-Status` / `-Teardown`；交互问答；参数 `-MySQL host:port` `-Redis host:port` 可覆盖）负责：平台守卫、前置自检、portproxy 管理、podman 网桥网关发现、把 `devbox/relay-vm.sh` 与渲染出的服务表 env 文件 `podman machine cp` 进 VM 后 `podman machine ssh sudo bash` 执行、最后从 devbox 容器探活并打印连接信息。
 
 `devbox/relay-vm.sh`（子命令 setup/status/teardown，ShellCheck 覆盖）负责 VM 内一切：dnf 装 socat、写 `/etc/cadence-relay.env`、管理 systemd 服务（或兜底 wsl.conf 钩子）、按配置端口启停监听。全程不使用内嵌长命令字符串（规避引号拆坏，install.ps1 同款教训）。
+
+交互与多服务（2026-10-16 改造）：重跑 setup 先回显 relay.json 已有通道（编号），
+「回车=全部保留，a=全部删除，逗号分隔=仅保留所列」；再目录多选新增（mysql/
+redis/kafka/zookeeper/rabbitmq 或 custom=服务名+IP:端口），逐项问远端地址；
+`-MySQL`/`-Redis` 参数继续映射 mysql/redis（清单中同名则更新地址，没有则直接
+新增）。`relay.json` services 为动态长度。**被删/改端口服务两侧清理**（陈旧判定
+按「旧 hostPort 不在新清单」，同时覆盖服务删除与同名换端口——按服务名判定会
+漏掉后者，旧 portproxy 将永久残留，评审 P2 修正；同端口重建仍由 add 前的
+delete 兜底）：Windows 侧 portproxy 在预检通过后、新建前按旧记录精确删除；
+VM 侧自有实例由本次 setup 按新 env 回收（relay-vm.sh 前段
+`recycle_stale_instances`：wants 目录扫描，仅链接解析到本方案模板且模板
+Description 匹配的自有 `cadence-relay@*` 才 disable --now + 清链接；未知/外来
+链接一律不动；回收表达用户删除意图，不参与事务回滚；置于占用分析之前，以便
+改名/重推导端口后旧实例先腾出新端口）。**boot 兜底模式**（无 systemd，socat
+由监督 nohup 拉起、非 systemd 实例）下由 `setup --retire <旧服务表>` 对账回收
+（relay.ps1 每次渲染旧表文件，无变更则仅表头）：对旧 vmport 上 is_expected_socat
+三参核验一致的自有监听精确 kill，未知不动；systemd 模式下该对账为幂等 no-op；
+对账 bind 用当前网关，网关漂移时旧监听 argv 对不上会被显式跳过（评审 P3 补）。
 
 ### D3. 持久化：每服务 systemd 模板实例，boot 钩子兜底（2026-10-14 修订）
 

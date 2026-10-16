@@ -5,6 +5,7 @@
 （守卫的平台/运行状态判定、原生错误显式传播、Die 退出码契约）。
 """
 import os
+import re
 import shutil
 import signal
 import socket
@@ -122,6 +123,78 @@ def test_install_ps1_gitignore_covers_relay_json():
 
 
 # ---------------------------------------------------------------------------
+# 2026-10-16 多服务通道改造：服务目录 / 端口推导（+10000/+20000）/ 删除回收。
+
+CATALOG_REMOTE_PORTS = {
+    "mysql": 3306, "redis": 6379, "kafka": 9092,
+    "zookeeper": 2181, "rabbitmq": 5672,
+}
+SERVICE_CATALOG = tuple(CATALOG_REMOTE_PORTS)
+
+
+def test_relay_ps1_service_catalog():
+    """服务目录：mysql/redis/kafka/zookeeper/rabbitmq 全部在册，且有自定义入口。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    for name in SERVICE_CATALOG:
+        assert f"{name} = " in text, f"服务目录缺目录项 {name}"
+    assert "custom" in text, "缺自定义服务入口（custom）"
+
+
+def test_relay_ps1_port_derivation_pins():
+    """推导规则钉住（2026-10-16 裁决）：hostPort=远端+10000、vmPort=远端+20000。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "Get-RelayPorts" in text, "缺端口推导函数 Get-RelayPorts"
+    assert "+ 10000" in text and "+ 20000" in text, "推导字面量 +10000/+20000 缺失"
+    assert "45535" in text, "缺远端端口上限校验（45535+20000=65535，不越界）"
+    assert "46535" not in text, "旧错值 46535 须清除（+20000 后越 65535）"
+
+
+def test_relay_stack_ports_guard_matches_compose():
+    """推导撞栈守卫：Get-RelayPorts 内置 stack 发布端口清单须与 compose 一致。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    m = re.search(r"\$stack = @\(([^)]*)\)", text)
+    assert m, "relay.ps1 缺内置 stack 发布端口清单 $stack"
+    got = {int(x) for x in re.findall(r"\d+", m.group(1))}
+    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    published = set()
+    for spec in doc["services"].values():
+        for p in spec.get("ports", []):
+            published.add(int(str(p).split(":")[1]))
+    assert got == published, f"$stack {sorted(got)} 与 compose {sorted(published)} 不一致"
+
+
+def test_catalog_derived_ports_vs_compose():
+    """目录各服务按常见远端端口推导后与 compose 发布端口零重叠；唯一例外
+    rabbitmq 5672（+10000=15672 撞本地管理台）由显式守卫拒绝（见行为测试）。"""
+    doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    published = set()
+    for spec in doc["services"].values():
+        for p in spec.get("ports", []):
+            published.add(int(str(p).split(":")[1]))
+    for name, remote in CATALOG_REMOTE_PORTS.items():
+        hit = {remote + 10000, remote + 20000} & published
+        if name == "rabbitmq":
+            assert hit == {15672}, "rabbitmq 撞点假设失效，守卫与文档须复核"
+        else:
+            assert not hit, f"{name} 推导端口与 compose 重叠：{sorted(hit)}"
+
+
+def test_relay_ps1_stale_service_cleanup_pins():
+    """删除服务：setup 须删被移除服务的 portproxy；VM 侧实例由 relay-vm.sh 回收。"""
+    ps1 = RELAY_PS1.read_text(encoding="utf-8")
+    setup = ps1.split("function Invoke-Setup", 1)[1].split("function Invoke-Status", 1)[0]
+    assert "portproxy delete" in setup, "setup 缺被移除服务的 portproxy delete"
+    assert "回收" in setup, "setup 须说明 VM 侧实例随 setup 回收"
+    assert "newPorts -notcontains" in setup, \
+        "陈旧判定须按旧 hostPort 不在新清单（覆盖改名/改端口残留），非按服务名"
+    assert "--retire" in setup, "setup 须把旧服务表传 VM 侧对账回收 boot 监听"
+    vm = RELAY_VM.read_text(encoding="utf-8")
+    assert "recycle_stale_instances" in vm, "relay-vm.sh 缺自有实例回收逻辑"
+    assert "retire_stale_listeners" in vm, "relay-vm.sh 缺 boot 兜底旧监听回收"
+    assert "disable --now" in vm, "回收须 disable --now 停实例"
+
+
+# ---------------------------------------------------------------------------
 # relay.ps1 行为回归：AST 抽取真实函数后在桩环境（fake cmd / fake podman）中执行。
 # 需要本机有 pwsh 且为 POSIX 平台（桩命令是 /bin/sh 脚本）；
 # Windows 侧人工解析验证同构：Language.Parser::ParseFile 须 0 错误（见 PARSE_HARNESS）。
@@ -185,6 +258,62 @@ if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit
 Write-Host 'PARSE_OK'
 exit 0
 """
+
+
+DERIVE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+foreach ($p in @(3306, 6379, 9092, 2181, 45535)) {
+  $r = Get-RelayPorts $p
+  Write-Host "port $p host=$($r.hostPort) vm=$($r.vmPort)"
+}
+exit 0
+"""
+
+DERIVE_CLASH_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$null = Get-RelayPorts 5672
+Write-Host 'UNREACHABLE'
+exit 0
+"""
+
+DERIVE_RANGE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$null = Get-RelayPorts 45536
+Write-Host 'UNREACHABLE'
+exit 0
+"""
+
+# 期望：远端端口 → (hostPort, vmPort)；mysql/redis 两行为存量兼容锚点（不得漂移）；
+# 45535 为上界锚点（+20000 恰 65535，不得再降一档拒收）
+DERIVED_EXPECT = {
+    3306: (13306, 23306), 6379: (16379, 26379),
+    9092: (19092, 29092), 2181: (12181, 22181),
+    45535: (55535, 65535),
+}
 
 
 def _write_stubs(bin_dir):
@@ -308,6 +437,36 @@ def test_die_exits_nonzero_and_prints(tmp_path):
     r = _run_harness(DIE_HARNESS, tmp_path)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "boom-die" in r.stdout
+
+
+@needs_pwsh
+def test_relay_derives_ports_for_any_remote_port(tmp_path):
+    """端口推导行为：任意远端端口 +10000/+20000；mysql/redis 存量值不变。"""
+    r = _run_harness(DERIVE_HARNESS, tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for remote, (host_port, vm_port) in DERIVED_EXPECT.items():
+        want = f"port {remote} host={host_port} vm={vm_port}"
+        assert want in r.stdout, f"推导应得 {want}：\n{r.stdout}"
+
+
+@needs_pwsh
+def test_relay_derivation_rejects_stack_clash(tmp_path):
+    """推导撞本地 stack（远端 5672→hostPort 15672 撞 rabbitmq 管理台）须显式拒绝。"""
+    r = _run_harness(DERIVE_CLASH_HARNESS, tmp_path)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "错误" in r.stdout and "15672" in r.stdout
+    assert "UNREACHABLE" not in r.stdout
+
+@needs_pwsh
+def test_relay_derivation_rejects_out_of_range(tmp_path):
+    """上界行为：45535 通过（vmPort 恰 65535），45536 显式拒绝（+20000 越界）。"""
+    ok = _run_harness(DERIVE_HARNESS, tmp_path)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "port 45535 host=55535 vm=65535" in ok.stdout, ok.stdout
+    bad = _run_harness(DERIVE_RANGE_HARNESS, tmp_path)
+    assert bad.returncode == 1, bad.stdout + bad.stderr
+    assert "错误" in bad.stdout and "45535" in bad.stdout
+    assert "UNREACHABLE" not in bad.stdout
 
 # ---------------------------------------------------------------------------
 # relay-vm.sh 每服务 systemd 持久化：沙箱真实行为回归（2026-10-14 固化裁决）。
@@ -936,3 +1095,77 @@ def test_vm_teardown_kills_boot_supervisor(vm_factory):
     assert vm.supervisor_pids() == [], "teardown 须停监督循环"
     for name, (vp, _hp) in VM_SVC.items():
         assert vm.pids_on_port(vp) == [], f"{name} 兜底监听须全部停止"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-16 多服务改造：setup 前段自有实例回收（服务删除的 VM 侧对称清理）。
+
+
+@needs_vm
+def test_vm_setup_recycles_removed_own_instances(vm_factory):
+    """env 删除某服务后重跑 setup：回收该自有实例（disable+清链接），未知不动。"""
+    vm = vm_factory()
+    vm.write_env({"mysql": VM_SVC["mysql"], "redis": VM_SVC["redis"]})
+    r = vm.run("setup")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert vm.mainpid("redis") in vm.pids_on_port(VM_SVC["redis"][0])
+    # 未知 wants 链接（指向外来 unit 文件）：一律不动
+    foreign = vm.unit_dir / "other.service"
+    foreign.write_text("[Unit]\nDescription=foreign\n", encoding="utf-8")
+    stranger = vm.unit_dir / "multi-user.target.wants" / "cadence-relay@stranger.service"
+    stranger.symlink_to(foreign)
+    vm.write_env({"mysql": VM_SVC["mysql"]})  # redis 从服务表删除
+    r2 = vm.run("setup", "--force")  # 沙箱内运行中实例无 cgroup 归属，重跑须 --force
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    calls = vm.calls()
+    assert "disable --now cadence-relay@redis" in calls, "须回收被删服务的实例"
+    assert vm.pids_on_port(VM_SVC["redis"][0]) == [], "redis 实例监听须停止"
+    wants = vm.unit_dir / "multi-user.target.wants"
+    assert not (wants / "cadence-relay@redis.service").exists(), "wants 链接须清除"
+    assert stranger.is_symlink(), "未知 wants 链接不得动"
+    assert not any("stranger" in c for c in calls), "未知实例不得被 disable"
+    assert vm.mainpid("mysql") in vm.pids_on_port(VM_SVC["mysql"][0]), "mysql 须不受影响"
+
+
+@needs_vm
+def test_vm_setup_recycle_ownership_rejects_tampered_template(vm_factory):
+    """回收所有权核验：模板 Description 非本方案产物时，指向模板的链接也不动。"""
+    vm = vm_factory()
+    vm.write_env({"mysql": VM_SVC["mysql"]})
+    r = vm.run("setup")
+    assert r.returncode == 0, r.stdout + r.stderr
+    tmpl = vm.unit_dir / "cadence-relay@.service"
+    body = tmpl.read_text(encoding="utf-8").replace(
+        "Description=cadence relay", "Description=foreign relay")
+    tmpl.write_text(body, encoding="utf-8")
+    vm.write_env({"redis": VM_SVC["redis"]})  # mysql 不在新服务表
+    r2 = vm.run("setup")
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    wants = vm.unit_dir / "multi-user.target.wants"
+    assert (wants / "cadence-relay@mysql.service").exists(), "所有权核验失败不得回收"
+    joined = "\n".join(vm.calls())
+    assert "disable --now cadence-relay@mysql" not in joined
+    assert vm.pids_on_port(VM_SVC["mysql"][0]), "mysql 实例监听须保持"
+
+
+@needs_vm
+def test_vm_setup_boot_retires_removed_listeners(vm_factory):
+    """boot 兜底删除回收：--retire 旧表对账杀被删服务的自有监听；未知不动。"""
+    vm = vm_factory(systemd_state="offline", wsl_conf="")
+    vm.write_env(VM_SVC)
+    assert vm.run("setup", "--force").returncode == 0
+    assert vm.pids_on_port(VM_SVC["redis"][0]), "boot 模式两监听须在"
+    # 未知监听占第三个端口：argv 与 retire 表行对不上（hostport 差一），不得动
+    stranger = vm.start_listener(
+        f"TCP-LISTEN:45399,bind={VM_BIND},fork,reuseaddr", "TCP:127.0.0.1:47398")
+    vm.write_env({"mysql": VM_SVC["mysql"]})  # redis 从服务表删除
+    retire = vm.env_file.parent / "cadence-relay.retired.env"
+    retire.write_text(
+        f"redis {VM_SVC['redis'][0]} {VM_BIND} {VM_SVC['redis'][1]}\n"
+        f"ghost 45399 {VM_BIND} 47399\n",
+        encoding="utf-8")
+    r = vm.run("setup", "--force", "--retire", str(retire))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert vm.pids_on_port(VM_SVC["redis"][0]) == [], "被删服务的 boot 监听须回收"
+    assert stranger.pid in vm.pids_on_port(45399), "未知监听不得动"
+    assert vm.pids_on_port(VM_SVC["mysql"][0]), "保留服务监听须仍在"

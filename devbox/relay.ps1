@@ -2,7 +2,7 @@
 # 设计与排障背景见 openspec/changes/add-remote-middleware-relay/ 与手册 devbox/README.md §2.6。
 # 用法（仓库根目录打开 PowerShell，管理员自动提升）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1                       # 拉通/更新（问答）
-#   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -MySQL 10.x.x.x:3306  # 参数覆盖问答
+#   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -MySQL 10.x.x.x:3306  # 指定 mysql（新增/改址）
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status               # 逐跳状态
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown             # 对称拆除
 #   存量安装目录（非仓库旁 cadence）须带 -InstallDir <目录>，如 -InstallDir D:\testpodman\cadence
@@ -117,10 +117,26 @@ function Resolve-Machine {
 }
 $mach = Resolve-Machine
 
-# ---- 服务表（与 stack 自带中间件端口错开：compose 发布 3306/6379/5672/15672/9000/9001/3000/8080） ----
-$ServiceDefaults = [ordered]@{
-  mysql = @{ hostPort = 13306; vmPort = 23306 }
-  redis = @{ hostPort = 16379; vmPort = 26379 }
+# ---- 服务目录与端口推导（2026-10-16 裁决；目录值为常见远端端口，仅作问答示例） ----
+$ServiceCatalog = [ordered]@{
+  mysql = 3306; redis = 6379; kafka = 9092; zookeeper = 2181; rabbitmq = 5672
+}
+
+# 推导：hostPort=remotePort+10000、vmPort=remotePort+20000——存量 mysql 3306→13306/23306、
+# redis 6379→16379/26379 不变，旧 relay.json 无需迁移。上限 45535（+20000 恰 65535）；
+# 推导命中本地 stack 发布端口即显式拒绝（$stack 清单与 compose.yaml 一致，测试钉住。
+# 唯一撞点：远端 rabbitmq 5672 → hostPort 15672 撞本地管理台，远端须换端口）
+function Get-RelayPorts($remotePort) {
+  if ($remotePort -lt 1 -or $remotePort -gt 45535) {
+    Die "远端端口超出可推导范围（1-45535）：$remotePort"
+  }
+  $hostPort = $remotePort + 10000
+  $vmPort = $remotePort + 20000
+  $stack = @(3000, 3306, 5672, 6379, 8080, 9000, 9001, 15672)
+  if ($stack -contains $hostPort -or $stack -contains $vmPort) {
+    Die "推导端口 $hostPort/$vmPort 撞本地 stack 发布端口（远端端口 $remotePort）"
+  }
+  return @{ hostPort = $hostPort; vmPort = $vmPort }
 }
 
 function Load-Config {
@@ -132,29 +148,105 @@ function Load-Config {
 
 function Test-AddrFormat($s) { return ($s -match '^(\d{1,3}\.){3}\d{1,3}:\d{2,5}$') }
 
-# 问答/参数合并出服务清单：参数覆盖 > 回显旧值回车保留 > 新问答
+function Test-SvcName($s) { return ($s -match '^[A-Za-z0-9_-]+$') }
+
+# 解析 IP:端口 → 服务对象（含推导端口）；格式/越界/撞栈在此显式报错
+function New-Service($name, $val) {
+  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
+  $hp = $val -split ':'
+  $ports = Get-RelayPorts ([int]$hp[1])
+  return [pscustomobject]@{
+    name = $name; remoteHost = $hp[0]; remotePort = [int]$hp[1]
+    hostPort = $ports.hostPort; vmPort = $ports.vmPort
+  }
+}
+
+# 问答/参数合并出服务清单（动态长度）：回显已有（保留/删除）→ 目录/自定义新增；
+# -MySQL/-Redis 参数映射目录项 mysql/redis：清单中同名则更新地址，没有则直接新增
 function Collect-Services($cfg) {
-  $paramBySvc = @{ mysql = $MySQL; redis = $Redis }
   $result = @()
-  foreach ($name in $ServiceDefaults.Keys) {
-    $old = $null
-    if ($cfg) { $hit = @($cfg.services | Where-Object { $_.name -eq $name }); if ($hit.Count -gt 0) { $old = $hit[0].remoteHost + ':' + $hit[0].remotePort } }
-    $val = ''
-    if ($paramBySvc[$name]) { $val = $paramBySvc[$name] }
-    else {
-      $tip = if ($old) { "回车保留 $old" } else { "例如 10.129.12.75:3306（IP:端口，域名暂不支持）" }
-      $val = Read-Host "远端 $name 地址（$tip）"
-      if (-not $val -and $old) { $val = $old }
+  $names = @{}
+  $old = @()
+  if ($cfg) { $old = @($cfg.services) }
+
+  if ($old.Count -gt 0) {
+    Info '已有通道（编号）：'
+    for ($i = 0; $i -lt $old.Count; $i++) {
+      $o = $old[$i]
+      $line = '  {0}. {1} → {2}:{3}（host {4} / vm {5}）' -f ($i + 1), $o.name, $o.remoteHost, $o.remotePort, $o.hostPort, $o.vmPort
+      Write-Host $line
     }
-    if (-not $val) { Warn "跳过 $name（未提供地址）"; continue }
-    if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
-    $hp = $val -split ':'
-    $result += [pscustomobject]@{
-      name = $name; remoteHost = $hp[0]; remotePort = [int]$hp[1]
-      hostPort = $ServiceDefaults[$name].hostPort; vmPort = $ServiceDefaults[$name].vmPort
+    $ans = (Read-Host '保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）').Trim()
+    $keepIdx = @()
+    if ($ans -ieq 'a') { $keepIdx = @() }
+    elseif ($ans -eq '') { for ($i = 0; $i -lt $old.Count; $i++) { $keepIdx += $i } }
+    else {
+      foreach ($tok in ($ans -split '[,，]')) {
+        $n = -1
+        if (-not [int]::TryParse($tok.Trim(), [ref]$n) -or $n -lt 1 -or $n -gt $old.Count) {
+          Die "序号无效：$tok（应为 1-$($old.Count)，或回车/a）"
+        }
+        if ($keepIdx -notcontains ($n - 1)) { $keepIdx += ($n - 1) }
+      }
+    }
+    foreach ($k in $keepIdx) { $names[$old[$k].name] = $true; $result += $old[$k] }
+    if ($keepIdx.Count -lt $old.Count) {
+      $removed = @()
+      for ($i = 0; $i -lt $old.Count; $i++) { if ($keepIdx -notcontains $i) { $removed += $old[$i].name } }
+      Info ("将删除：" + ($removed -join '、') + "（清 portproxy，VM 实例随 setup 回收）")
     }
   }
-  if ($result.Count -eq 0) { Die '未配置任何服务，无事可做' }
+
+  foreach ($pn in @('mysql', 'redis')) {
+    $val = @{ mysql = $MySQL; redis = $Redis }[$pn]
+    if (-not $val) { continue }
+    $obj = New-Service $pn $val
+    if ($names.ContainsKey($pn)) {
+      for ($j = 0; $j -lt $result.Count; $j++) {
+        if ($result[$j].name -eq $pn) { $result[$j] = $obj; break }
+      }
+      Info "参数更新 $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
+    } else {
+      $names[$pn] = $true
+      $result += $obj
+      Info "参数新增 $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
+    }
+  }
+
+  $catNames = @($ServiceCatalog.Keys)
+  Info ('可新增（目录：' + ($catNames -join ' ') + '；custom=自定义；回车跳过）')
+  $pick = (Read-Host '新增（多项逗号分隔，如 kafka,zookeeper 或 custom）').Trim()
+  foreach ($tok in ($pick -split '[,，]')) {
+    $t = $tok.Trim()
+    if (-not $t) { continue }
+    if ($t -ieq 'custom' -or $t -eq '自定义') {
+      $newName = (Read-Host '自定义服务名（限字母数字与 _-，如 es7、db2-prod）').Trim()
+      if (-not $newName) { Warn '未输入服务名，跳过自定义项'; continue }
+      if (-not (Test-SvcName $newName)) { Die "服务名限字母数字与 _-：$newName" }
+      if ($names.ContainsKey($newName)) { Warn "$newName 已在清单中，跳过"; continue }
+      $val = (Read-Host "远端 $newName 地址（IP:端口，域名暂不支持）").Trim()
+      if (-not $val) { Warn "跳过 $newName（未提供地址）"; continue }
+      $names[$newName] = $true
+      $result += (New-Service $newName $val)
+    } else {
+      if ($catNames -notcontains $t) { Die "未知目录项：$t（目录：$($catNames -join ' ') 或 custom）" }
+      if ($names.ContainsKey($t)) { Warn "$t 已在清单中，跳过（改地址：不保留该项后新增）"; continue }
+      $val = (Read-Host "远端 $t 地址（例如 10.129.12.75:$($ServiceCatalog[$t])，IP:端口）").Trim()
+      if (-not $val) { Warn "跳过 $t（未提供地址）"; continue }
+      $names[$t] = $true
+      $result += (New-Service $t $val)
+    }
+  }
+
+  # 端口冲突预检：不同服务不得推导/沿用相同 host/vm 端口（同远端端口必撞）
+  $seen = @{}
+  foreach ($s in $result) {
+    foreach ($p in @($s.hostPort, $s.vmPort)) {
+      if ($seen.ContainsKey($p)) { Die "端口 $p 同时属于 $($seen[$p]) 与 $($s.name)，请调整其一" }
+      $seen[$p] = $s.name
+    }
+  }
+  if ($result.Count -eq 0) { Die '未配置任何服务（重跑 setup 须至少保留/新增一项；全部拆除请用 -Teardown）' }
   return $result
 }
 
@@ -196,7 +288,17 @@ function Undo-Portproxy($ports) { # 失败路径回滚已建 portproxy，避免�
 # ---- 通道搭建 ----
 function Invoke-Setup {
   $cfg = Load-Config
-  $services = Collect-Services $cfg
+  $services = @(Collect-Services $cfg)
+  # 被删/改端口服务（旧 hostPort 不在新清单，覆盖同名换端口）：预检后清 portproxy；
+  # VM 侧实例随 setup 回收、boot 监听按旧表对账回收（--retire）
+  $stale = @()
+  if ($cfg) {
+    $newPorts = @($services | ForEach-Object { $_.hostPort })
+    foreach ($o in @($cfg.services)) {
+      if ($newPorts -notcontains $o.hostPort) { $stale += $o }
+    }
+  }
+
 
   # 前置自检：远端可达（此时尚无任何改动，失败零残留）
   foreach ($s in $services) {
@@ -204,6 +306,13 @@ function Invoke-Setup {
       Die "远端 $($s.name) $($s.remoteHost):$($s.remotePort) 不可达——请先连接 VPN 再重试"
     }
     Info "预检通过：$($s.name) → $($s.remoteHost):$($s.remotePort)"
+  }
+
+  # 被删服务清理（预检通过后才开始改动）：Windows 侧 portproxy 即删；
+  # VM 侧自有实例由本次 relay-vm.sh setup 按新服务表渲染 env 时一并回收
+  foreach ($o in $stale) {
+    $null = cmd /c "netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=$($o.hostPort) 2>nul"
+    Info "已删 $($o.name) 的 portproxy 127.0.0.1:$($o.hostPort)（VM 实例随 setup 回收）"
   }
 
   $gw = Get-BridgeGateway
@@ -220,23 +329,36 @@ function Invoke-Setup {
     Info "portproxy：127.0.0.1:$($s.hostPort) → $($s.remoteHost):$($s.remotePort)"
   }
 
-  # VM 侧：渲染服务表 env → cp 两文件 → ssh 执行 setup
+  # VM 侧：渲染服务表 env 与旧表对账文件 → cp → ssh 执行 setup（--retire）
   $envFile = Join-Path $env:TEMP 'cadence-relay.env'
   $envLines = @('# name vmport bindaddr hostport')
   foreach ($s in $services) { $envLines += "$($s.name) $($s.vmPort) $gw $($s.hostPort)" }
   ($envLines -join "`n") + "`n" | Set-Content -Encoding ascii -NoNewline $envFile
+  # 旧服务表（无变更则仅表头）：boot 兜底模式下 setup 按三参核验回收被删/改端口
+  # 监听（systemd 模式由实例回收覆盖，此对账为幂等 no-op）。bind 用当前网关——
+  # 网关漂移时旧监听 argv 对不上会被 VM 侧显式跳过（不动未知）
+  $retireFile = Join-Path $env:TEMP 'cadence-relay.retired.env'
+  $retLines = @('# name vmport bindaddr hostport')
+  foreach ($o in $stale) { $retLines += "$($o.name) $($o.vmPort) $gw $($o.hostPort)" }
+  ($retLines -join "`n") + "`n" | Set-Content -Encoding ascii -NoNewline $retireFile
   podman machine cp "$PSScriptRoot\relay-vm.sh" "${mach}:/tmp/cadence-relay-vm.sh"
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay-vm.sh 失败' }
   podman machine cp "$envFile" "${mach}:/tmp/cadence-relay.env"
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay.env 失败' }
-  $null = podman machine ssh "sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh && sudo mv /tmp/cadence-relay.env /etc/cadence-relay.env"
+  podman machine cp "$retireFile" "${mach}:/tmp/cadence-relay.retired.env"
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp retire.env 失败' }
+  $mvCmd = 'sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh'
+  $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay.env /etc/cadence-relay.env"
+  $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay.retired.env /etc/cadence-relay.retired.env"
+  $null = podman machine ssh $mvCmd
 
-  $null = podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh setup'
+  $setupCmd = 'sudo bash /usr/local/bin/relay-vm.sh setup --retire /etc/cadence-relay.retired.env'
+  $null = podman machine ssh $setupCmd
   if ($LASTEXITCODE -eq 3) {
     Warn 'VM 侧端口被存量监听占用（如手搭中继 socat-mysql-relay）。'
     $ans = Read-Host '确认拆除占用者并由本脚本接管？(Y/N)'
     if ($ans -notmatch '^[Yy]') { Undo-Portproxy $created; Die '已取消。可先手工拆除占用者后重跑' }
-    $null = podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh setup --force'
+    $null = podman machine ssh "$setupCmd --force"
   }
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die "VM 侧 setup 失败（exit $LASTEXITCODE），日志：podman machine ssh 'tail /var/log/cadence-relay.log'" }
 
