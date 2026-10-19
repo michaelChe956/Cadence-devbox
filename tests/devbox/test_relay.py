@@ -4,6 +4,7 @@
 除源码结构契约外，用 pwsh 执行从 relay.ps1 AST 抽取的真实函数做行为回归
 （守卫的平台/运行状态判定、原生错误显式传播、Die 退出码契约）。
 """
+import json
 import os
 import re
 import shutil
@@ -50,6 +51,7 @@ def test_relay_ps1_switches():
     for token in (
         "[switch]$Status",
         "[switch]$Teardown",
+        "[switch]$List",
         "[string]$MySQL",
         "[string]$Redis",
     ):
@@ -142,19 +144,22 @@ def test_relay_ps1_service_catalog():
 
 
 def test_relay_ps1_port_derivation_pins():
-    """推导规则钉住（2026-10-16 裁决）：hostPort=远端+10000、vmPort=远端+20000。"""
+    """推导规则钉住（2026-10-19 裁决）：hostPort=远端+10000、vmPort=hostPort+10000，
+    占用（已分配端口或 stack 发布端口）时 host/vm 同步顺延 +1。"""
     text = RELAY_PS1.read_text(encoding="utf-8")
     assert "Get-RelayPorts" in text, "缺端口推导函数 Get-RelayPorts"
-    assert "+ 10000" in text and "+ 20000" in text, "推导字面量 +10000/+20000 缺失"
-    assert "45535" in text, "缺远端端口上限校验（45535+20000=65535，不越界）"
-    assert "46535" not in text, "旧错值 46535 须清除（+20000 后越 65535）"
+    assert "+ 10000" in text, "推导字面量 +10000 缺失（hostPort=远端+10000、vmPort=hostPort+10000）"
+    assert "45535" in text, "缺远端端口上限校验（1-45535）"
+    assert "55535" in text, "缺顺延后 hostPort 上限（55535，vmPort 恒 ≤65535）"
+    assert "46535" not in text, "旧错值 46535 须清除"
 
 
 def test_relay_stack_ports_guard_matches_compose():
-    """推导撞栈守卫：Get-RelayPorts 内置 stack 发布端口清单须与 compose 一致。"""
+    """顺延越过集合：Get-StackPortList 内置 stack 发布端口清单须与 compose 一致。"""
     text = RELAY_PS1.read_text(encoding="utf-8")
     m = re.search(r"\$stack = @\(([^)]*)\)", text)
     assert m, "relay.ps1 缺内置 stack 发布端口清单 $stack"
+    assert "Get-StackPortList" in text, "stack 清单须以 Get-StackPortList 单一来源供推导/显式校验共用"
     got = {int(x) for x in re.findall(r"\d+", m.group(1))}
     doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     published = set()
@@ -165,19 +170,33 @@ def test_relay_stack_ports_guard_matches_compose():
 
 
 def test_catalog_derived_ports_vs_compose():
-    """目录各服务按常见远端端口推导后与 compose 发布端口零重叠；唯一例外
-    rabbitmq 5672（+10000=15672 撞本地管理台）由显式守卫拒绝（见行为测试）。"""
+    """目录各服务按常见远端端口推导并顺延后与 compose 发布端口零重叠
+    （rabbitmq 5672 撞 15672 自动越过得 15673/25673）。"""
     doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     published = set()
     for spec in doc["services"].values():
         for p in spec.get("ports", []):
             published.add(int(str(p).split(":")[1]))
     for name, remote in CATALOG_REMOTE_PORTS.items():
-        hit = {remote + 10000, remote + 20000} & published
+        host = remote + 10000
+        while host in published or (host + 10000) in published:
+            host += 1
+        assert host <= 55535, f"{name} 顺延越界（hostPort 上限 55535）"
+        hit = {host, host + 10000} & published
+        assert not hit, f"{name} 顺延后推导端口仍与 compose 重叠：{sorted(hit)}"
         if name == "rabbitmq":
-            assert hit == {15672}, "rabbitmq 撞点假设失效，守卫与文档须复核"
-        else:
-            assert not hit, f"{name} 推导端口与 compose 重叠：{sorted(hit)}"
+            assert host == 15673, "rabbitmq 顺延假设失效（应越过 15672 得 15673），文档须复核"
+
+
+def test_relay_ps1_edit_and_list_pins():
+    """2026-10-19 裁决钉住：修改问答提示语、-List 入口、gateway 落盘与开关互斥。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "要修改的已有序号（回车跳过，逗号分隔）" in text, "缺修改问答提示"
+    assert "新本地端口（回车=自动推导；直接输入数字覆盖）" in text, "缺本地端口覆盖提示"
+    assert "gateway = $gw" in text, "setup 落盘 relay.json 须记录网关（-List 免探测）"
+    assert "Invoke-List" in text, "缺 -List 实现（Invoke-List）"
+    assert "只能选一" in text, "-Status/-Teardown/-List 须互斥"
+    assert "TcpClient" not in text, "终端管控红线：不得出现 TcpClient 字面量"
 
 
 def test_relay_ps1_stale_service_cleanup_pins():
@@ -266,29 +285,51 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+foreach ($n in @('Info','Warn','Die','Get-StackPortList','Get-RelayPorts')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
 }
-foreach ($p in @(3306, 6379, 9092, 2181, 45535)) {
-  $r = Get-RelayPorts $p
+foreach ($p in @(3306, 6379, 9092, 2181, 5672, 45535)) {
+  $r = Get-RelayPorts $p @{}
   Write-Host "port $p host=$($r.hostPort) vm=$($r.vmPort)"
 }
 exit 0
 """
 
-DERIVE_CLASH_HARNESS = r"""
+DERIVE_SHIFT_HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+foreach ($n in @('Info','Warn','Die','Get-StackPortList','Get-RelayPorts')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
 }
-$null = Get-RelayPorts 5672
+$t = @{}
+$a = Get-RelayPorts 3306 $t
+$t[$a.hostPort] = 'first'
+$t[$a.vmPort] = 'first'
+$b = Get-RelayPorts 3306 $t
+Write-Host "first host=$($a.hostPort) vm=$($a.vmPort)"
+Write-Host "second host=$($b.hostPort) vm=$($b.vmPort)"
+exit 0
+"""
+
+DERIVE_OVERFLOW_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Get-StackPortList','Get-RelayPorts')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$t = @{}
+$t[55535] = 'blocker'
+$null = Get-RelayPorts 45535 $t
 Write-Host 'UNREACHABLE'
 exit 0
 """
@@ -298,22 +339,22 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Get-RelayPorts')) {
+foreach ($n in @('Info','Warn','Die','Get-StackPortList','Get-RelayPorts')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
 }
-$null = Get-RelayPorts 45536
+$null = Get-RelayPorts 45536 @{}
 Write-Host 'UNREACHABLE'
 exit 0
 """
 
 # 期望：远端端口 → (hostPort, vmPort)；mysql/redis 两行为存量兼容锚点（不得漂移）；
-# 45535 为上界锚点（+20000 恰 65535，不得再降一档拒收）
+# 5672 验证自动越过 stack（15672→15673/25673）；45535 为上界锚点（+20000 恰 65535）
 DERIVED_EXPECT = {
     3306: (13306, 23306), 6379: (16379, 26379),
     9092: (19092, 29092), 2181: (12181, 22181),
-    45535: (55535, 65535),
+    5672: (15673, 25673), 45535: (55535, 65535),
 }
 
 
@@ -336,6 +377,10 @@ def _write_stubs(bin_dir):
         '  [ -n "$FAKE_INSPECT_STDERR" ] && echo "$FAKE_INSPECT_STDERR" >&2\n'
         '  [ -n "$FAKE_INSPECT_FILE" ] && cat "$FAKE_INSPECT_FILE"\n'
         "  exit ${FAKE_INSPECT_EXIT:-0}\n"
+        "fi\n"
+        'if [ "$1" = "network" ] && [ "$2" = "inspect" ]; then\n'
+        '  echo "${FAKE_NET_GW:-10.89.0.1}"\n'
+        "  exit 0\n"
         "fi\n"
         'echo "podman: unsupported: $*" >&2\n'
         "exit 1\n"
@@ -451,11 +496,20 @@ def test_relay_derives_ports_for_any_remote_port(tmp_path):
 
 
 @needs_pwsh
-def test_relay_derivation_rejects_stack_clash(tmp_path):
-    """推导撞本地 stack（远端 5672→hostPort 15672 撞 rabbitmq 管理台）须显式拒绝。"""
-    r = _run_harness(DERIVE_CLASH_HARNESS, tmp_path)
+def test_relay_derivation_autoshifts_on_duplicate(tmp_path):
+    """多实例同远端端口：占用表内二次推导 3306 自动顺延 +1（vmPort=hostPort+10000）。"""
+    r = _run_harness(DERIVE_SHIFT_HARNESS, tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "first host=13306 vm=23306" in r.stdout, r.stdout
+    assert "second host=13307 vm=23307" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_relay_derivation_shift_overflow_dies(tmp_path):
+    """顺延越界：45535 的推导端口（55535/65535）被占后顺延须 Die 说明越界。"""
+    r = _run_harness(DERIVE_OVERFLOW_HARNESS, tmp_path)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "错误" in r.stdout and "15672" in r.stdout
+    assert "顺延越界" in r.stdout and "55535" in r.stdout
     assert "UNREACHABLE" not in r.stdout
 
 @needs_pwsh
@@ -468,6 +522,224 @@ def test_relay_derivation_rejects_out_of_range(tmp_path):
     assert bad.returncode == 1, bad.stdout + bad.stderr
     assert "错误" in bad.stdout and "45535" in bad.stdout
     assert "UNREACHABLE" not in bad.stdout
+
+# ---------------------------------------------------------------------------
+# 2026-10-19 端口自动顺延 + 交互修改 + -List：AST 抽取真实函数，
+# Read-Host 用同名函数遮蔽回放预置答案，Collect-Services/Invoke-List 全流程行为回归。
+
+COLLECT_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-SvcName','Get-StackPortList','Get-RelayPorts','New-Service','New-ServiceWithHostPort','Collect-Services')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$ServiceCatalog = [ordered]@{
+  mysql = 3306; redis = 6379; kafka = 9092; zookeeper = 2181; rabbitmq = 5672
+}
+$MySQL = $env:FAKE_MYSQL
+$Redis = $env:FAKE_REDIS
+$script:ansArr = @(($env:FAKE_ANSWERS -split "`n"))
+$script:ansPos = 0
+function Read-Host($prompt) {
+  if ($script:ansPos -ge $script:ansArr.Count) { Write-Host 'NO_MORE_ANSWERS'; exit 4 }
+  $v = $script:ansArr[$script:ansPos]
+  $script:ansPos = $script:ansPos + 1
+  Write-Host "ANSWER[$v]: $prompt"
+  return $v
+}
+$cfg = $null
+if ($env:FAKE_RELAY_JSON -and (Test-Path $env:FAKE_RELAY_JSON)) {
+  $cfg = Get-Content -Raw $env:FAKE_RELAY_JSON | ConvertFrom-Json
+}
+$svcs = @(Collect-Services $cfg)
+Write-Host 'RESULT-BEGIN'
+foreach ($s in $svcs) {
+  Write-Host ("SVC {0} {1}:{2} host={3} vm={4}" -f $s.name, $s.remoteHost, $s.remotePort, $s.hostPort, $s.vmPort)
+}
+Write-Host 'RESULT-END'
+exit 0
+"""
+
+LIST_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','RunQuiet','Probe','Load-Config','Get-BridgeGateway','Invoke-List')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$RelayJson = $env:FAKE_RELAY_JSON
+Invoke-List
+exit 0
+"""
+
+
+def _svc(name, host, remote_port, host_port, vm_port):
+    return {
+        "name": name, "remoteHost": host, "remotePort": remote_port,
+        "hostPort": host_port, "vmPort": vm_port,
+    }
+
+
+def _run_collect(tmp_path, answers, relay_json=None, mysql=None, redis=None):
+    rj = tmp_path / "relay.json"
+    if relay_json is not None:
+        rj.write_text(json.dumps(relay_json), encoding="utf-8")
+    env = {
+        "FAKE_ANSWERS": "\n".join(answers),
+        "FAKE_RELAY_JSON": str(rj),
+        "FAKE_MYSQL": mysql or "",
+        "FAKE_REDIS": redis or "",
+    }
+    return _run_harness(COLLECT_HARNESS, tmp_path, env_extra=env)
+
+
+def _collect_result_lines(stdout):
+    return [l.strip() for l in stdout.splitlines() if l.startswith("SVC ")]
+
+
+@needs_pwsh
+def test_collect_kept_items_keep_ports_and_order(tmp_path):
+    """全保留+不修改+不新增：端口与顺序零漂移（回车跳过=配置零变化）。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306),
+        _svc("mysql_log", "10.1.1.2", 3306, 13307, 23307),
+    ]}
+    r = _run_collect(tmp_path, ["", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.1.1.1:3306 host=13306 vm=23306",
+        "SVC mysql_log 10.1.1.2:3306 host=13307 vm=23307",
+    ], r.stdout
+
+
+@needs_pwsh
+def test_collect_autoshifts_same_remote_port(tmp_path):
+    """多实例同远端端口：-MySQL 新增 mysql 后自定义 mysql_log（同 3306）顺延 +1。"""
+    r = _run_collect(
+        tmp_path, ["custom", "mysql_log", "10.1.1.2:3306"],
+        mysql="10.1.1.1:3306",
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.1.1.1:3306 host=13306 vm=23306",
+        "SVC mysql_log 10.1.1.2:3306 host=13307 vm=23307",
+    ], r.stdout
+    assert "自动顺延" in r.stdout, "顺延发生时输出须带标记：\n" + r.stdout
+
+
+@needs_pwsh
+def test_collect_catalog_rabbitmq_shifts_over_stack(tmp_path):
+    """目录 rabbitmq 5672：推导撞 15672 自动越过得 15673/25673，不再显式拒绝。"""
+    r = _run_collect(tmp_path, ["rabbitmq", "10.1.1.3:5672"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC rabbitmq 10.1.1.3:5672 host=15673 vm=25673",
+    ], r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_address_keeps_ports(tmp_path):
+    """修改问答改 IP：relay.json 结果换地址、端口不变（无冲突时推导=旧值）。"""
+    cfg = {"version": 1, "services": [_svc("mysql", "10.1.1.1", 3306, 13306, 23306)]}
+    r = _run_collect(tmp_path, ["", "1", "10.2.2.2:3306", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.2.2.2:3306 host=13306 vm=23306",
+    ], r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_explicit_port_syncs_vm(tmp_path):
+    """修改问答显式端口 14000：vmPort 恒为 hostPort+10000=24000。"""
+    cfg = {"version": 1, "services": [_svc("mysql", "10.1.1.1", 3306, 13306, 23306)]}
+    r = _run_collect(tmp_path, ["", "1", "", "14000", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.1.1.1:3306 host=14000 vm=24000",
+    ], r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_explicit_port_stack_clash_dies(tmp_path):
+    """显式端口撞 stack 发布端口（3306）：Die 说明，不产出任何结果。"""
+    cfg = {"version": 1, "services": [_svc("mysql", "10.1.1.1", 3306, 13306, 23306)]}
+    r = _run_collect(tmp_path, ["", "1", "", "3306"], relay_json=cfg)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "撞本地 stack" in r.stdout, r.stdout
+    assert "RESULT-BEGIN" not in r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_explicit_port_duplicate_dies(tmp_path):
+    """显式端口与其他保留服务端口重复：Die 指明冲突服务。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306),
+        _svc("redis", "10.1.1.4", 6379, 16379, 26379),
+    ]}
+    r = _run_collect(tmp_path, ["", "2", "", "13306"], relay_json=cfg)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "与服务 mysql" in r.stdout, r.stdout
+    assert "RESULT-BEGIN" not in r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_index_not_kept_dies(tmp_path):
+    """修改序号未在保留列表：Die 说明（不能修改被删除的项）。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306),
+        _svc("redis", "10.1.1.4", 6379, 16379, 26379),
+    ]}
+    r = _run_collect(tmp_path, ["1", "2"], relay_json=cfg)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "未在保留列表" in r.stdout, r.stdout
+
+
+def _run_list(tmp_path, relay_json=None, env_extra=None):
+    rj = tmp_path / "relay.json"
+    if relay_json is not None:
+        rj.write_text(json.dumps(relay_json), encoding="utf-8")
+    env = {"FAKE_RELAY_JSON": str(rj)}
+    env.update(env_extra or {})
+    return _run_harness(LIST_HARNESS, tmp_path, env_extra=env)
+
+
+@needs_pwsh
+def test_list_prints_table_from_relay_json(tmp_path):
+    """-List：只读 relay.json 打印表格（含 gateway 容器连接地址），不探活。"""
+    cfg = {"version": 1, "gateway": "10.89.0.1", "services": [
+        _svc("mysql", "10.129.12.75", 3306, 13306, 23306),
+    ]}
+    r = _run_list(tmp_path, relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for token in ("mysql", "10.129.12.75:3306", "127.0.0.1:13306",
+                  "10.89.0.1:23306", "Windows portproxy", "容器连接地址"):
+        assert token in r.stdout, f"-List 输出缺 {token}：\n{r.stdout}"
+    for line in r.stdout.splitlines():
+        assert len(line) <= 100, f"-List 输出行超 100 字符：{line}"
+
+
+@needs_pwsh
+def test_list_dies_without_relay_json(tmp_path):
+    """-List 无 relay.json：Die「通道未建立」，非零退出。"""
+    r = _run_list(tmp_path)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "通道未建立" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_list_legacy_json_resolves_gateway_live(tmp_path):
+    """旧版 relay.json 无 gateway 字段：现场解析 podman 网桥网关（fake stub）。"""
+    cfg = {"version": 1, "services": [_svc("mysql", "10.1.1.1", 3306, 13306, 23306)]}
+    r = _run_list(tmp_path, relay_json=cfg, env_extra={"FAKE_NET_GW": "10.99.0.1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "10.99.0.1:23306" in r.stdout, r.stdout
 
 # ---------------------------------------------------------------------------
 # relay-vm.sh 每服务 systemd 持久化：沙箱真实行为回归（2026-10-14 固化裁决）。

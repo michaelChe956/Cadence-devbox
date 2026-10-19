@@ -4,11 +4,13 @@
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1                       # 拉通/更新（问答）
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -MySQL 10.x.x.x:3306  # 指定 mysql（新增/改址）
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status               # 逐跳状态
+#   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -List                # 只读查看已配置服务表
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown             # 对称拆除
 #   存量安装目录（非仓库旁 cadence）须带 -InstallDir <目录>，如 -InstallDir D:\testpodman\cadence
 param(
   [switch]$Status,
   [switch]$Teardown,
+  [switch]$List,
   [string]$MySQL = "",
   [string]$Redis = "",
   [string]$InstallDir = ""
@@ -122,21 +124,35 @@ $ServiceCatalog = [ordered]@{
   mysql = 3306; redis = 6379; kafka = 9092; zookeeper = 2181; rabbitmq = 5672
 }
 
-# 推导：hostPort=remotePort+10000、vmPort=remotePort+20000——存量 mysql 3306→13306/23306、
-# redis 6379→16379/26379 不变，旧 relay.json 无需迁移。上限 45535（+20000 恰 65535）；
-# 推导命中本地 stack 发布端口即显式拒绝（$stack 清单与 compose.yaml 一致，测试钉住。
-# 唯一撞点：远端 rabbitmq 5672 → hostPort 15672 撞本地管理台，远端须换端口）
-function Get-RelayPorts($remotePort) {
+# 本地 stack 发布端口（与 compose.yaml 一致，测试钉住）：端口顺延与显式指定均须避开
+function Get-StackPortList {
+  $stack = @(3000, 3306, 5672, 6379, 8080, 9000, 9001, 15672)
+  return $stack
+}
+
+# 推导+自动顺延（2026-10-19 裁决）：hostPort=远端+10000、vmPort=hostPort+10000（存量
+# mysql 3306→13306/23306、redis 6379→16379/26379 不变，旧 relay.json 无需迁移）；
+# 候选端口（host/vm 任一）命中 $taken（已分配服务端口）或本地 stack 发布端口时整体
+# +1 重试。多实例同远端端口依次顺延（mysql→13306/23306、mysql_log→13307/23307）；
+# 远端 rabbitmq 5672 自动越过 15672 得 15673/25673。远端端口范围 1-45535；顺延后
+# hostPort 须 ≤55535（vmPort 恒 ≤65535），越界显式报错。
+function Get-RelayPorts($remotePort, $taken) {
   if ($remotePort -lt 1 -or $remotePort -gt 45535) {
     Die "远端端口超出可推导范围（1-45535）：$remotePort"
   }
   $hostPort = $remotePort + 10000
-  $vmPort = $remotePort + 20000
-  $stack = @(3000, 3306, 5672, 6379, 8080, 9000, 9001, 15672)
-  if ($stack -contains $hostPort -or $stack -contains $vmPort) {
-    Die "推导端口 $hostPort/$vmPort 撞本地 stack 发布端口（远端端口 $remotePort）"
+  while ($true) {
+    if ($hostPort -gt 55535) {
+      Die "顺延越界：远端端口 $remotePort 顺延后 hostPort $hostPort 超上限 55535（vmPort 须 ≤65535）"
+    }
+    $vmPort = $hostPort + 10000
+    $stack = Get-StackPortList
+    $busy = ($taken -and $taken.ContainsKey($hostPort)) -or ($stack -contains $hostPort)
+    if ($busy) { $hostPort++; continue }
+    $busy = ($taken -and $taken.ContainsKey($vmPort)) -or ($stack -contains $vmPort)
+    if ($busy) { $hostPort++; continue }
+    return @{ hostPort = $hostPort; vmPort = $vmPort }
   }
-  return @{ hostPort = $hostPort; vmPort = $vmPort }
 }
 
 function Load-Config {
@@ -150,24 +166,60 @@ function Test-AddrFormat($s) { return ($s -match '^(\d{1,3}\.){3}\d{1,3}:\d{2,5}
 
 function Test-SvcName($s) { return ($s -match '^[A-Za-z0-9_-]+$') }
 
-# 解析 IP:端口 → 服务对象（含推导端口）；格式/越界/撞栈在此显式报错
-function New-Service($name, $val) {
+# 解析 IP:端口 → 服务对象（含推导端口，占用表感知自动顺延）；格式/越界在此显式报错
+function New-Service($name, $val, $taken) {
   if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
   $hp = $val -split ':'
-  $ports = Get-RelayPorts ([int]$hp[1])
+  $ports = Get-RelayPorts ([int]$hp[1]) $taken
+  $taken[$ports.hostPort] = $name
+  $taken[$ports.vmPort] = $name
   return [pscustomobject]@{
     name = $name; remoteHost = $hp[0]; remotePort = [int]$hp[1]
     hostPort = $ports.hostPort; vmPort = $ports.vmPort
   }
 }
 
-# 问答/参数合并出服务清单（动态长度）：回显已有（保留/删除）→ 目录/自定义新增；
-# -MySQL/-Redis 参数映射目录项 mysql/redis：清单中同名则更新地址，没有则直接新增
+# 显式指定本地端口（交互修改用）：校验范围/撞栈/撞已分配；vmPort 恒为 hostPort+10000
+function New-ServiceWithHostPort($name, $val, $hostPort, $taken) {
+  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
+  $hp = $val -split ':'
+  $rp = [int]$hp[1]
+  if ($rp -lt 1 -or $rp -gt 45535) { Die "$name 远端端口超出可推导范围（1-45535）：$rp" }
+  if ($hostPort -lt 1 -or $hostPort -gt 55535) { Die "$name 本地端口须在 1-55535：$hostPort" }
+  $vmPort = $hostPort + 10000
+  $stack = Get-StackPortList
+  foreach ($p in @($hostPort, $vmPort)) {
+    if ($stack -contains $p) { Die "$name 指定端口 $p 撞本地 stack 发布端口，请换一个" }
+    if ($taken.ContainsKey($p)) { Die "$name 指定端口 $p 与服务 $($taken[$p]) 的端口冲突，请换一个" }
+  }
+  $taken[$hostPort] = $name
+  $taken[$vmPort] = $name
+  return [pscustomobject]@{
+    name = $name; remoteHost = $hp[0]; remotePort = $rp
+    hostPort = $hostPort; vmPort = $vmPort
+  }
+}
+
+# 问答/参数合并出服务清单（动态长度）：回显已有（保留/删除）→ 交互修改保留项 → 目录/自定义新增；
+# -MySQL/-Redis 参数映射目录项 mysql/redis：清单中同名则更新地址，没有则直接新增。
+# 端口分配（2026-10-19 裁决）：未修改保留项沿用旧端口（先入占用表 $taken，不重推导）；
+# 修改/参数/新增项按清单顺序走 Get-RelayPorts 占用感知顺延（含越过 stack 端口），
+# vmPort 恒为 hostPort+10000；result 按原相对顺序拼装，relay.json 顺序保持、重跑稳定。
 function Collect-Services($cfg) {
   $result = @()
   $names = @{}
   $old = @()
-  if ($cfg) { $old = @($cfg.services) }
+  if ($cfg) {
+    # JSON 数值 pwsh7 下解析为 Int64、WinPS 为 Int32：统一转 [int]，保证占用表键与
+    # 推导/校验的 Int32 探针同型（否则 ContainsKey/-contains 会误判为不冲突）
+    $old = @($cfg.services | ForEach-Object {
+      [pscustomobject]@{
+        name = $_.name; remoteHost = $_.remoteHost
+        remotePort = [int]$_.remotePort; hostPort = [int]$_.hostPort; vmPort = [int]$_.vmPort
+      }
+    })
+  }
+  $keepIdx = @()
 
   if ($old.Count -gt 0) {
     Info '已有通道（编号）：'
@@ -177,7 +229,6 @@ function Collect-Services($cfg) {
       Write-Host $line
     }
     $ans = (Read-Host '保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）').Trim()
-    $keepIdx = @()
     if ($ans -ieq 'a') { $keepIdx = @() }
     elseif ($ans -eq '') { for ($i = 0; $i -lt $old.Count; $i++) { $keepIdx += $i } }
     else {
@@ -189,28 +240,100 @@ function Collect-Services($cfg) {
         if ($keepIdx -notcontains ($n - 1)) { $keepIdx += ($n - 1) }
       }
     }
-    foreach ($k in $keepIdx) { $names[$old[$k].name] = $true; $result += $old[$k] }
     if ($keepIdx.Count -lt $old.Count) {
       $removed = @()
       for ($i = 0; $i -lt $old.Count; $i++) { if ($keepIdx -notcontains $i) { $removed += $old[$i].name } }
       Info ("将删除：" + ($removed -join '、') + "（清 portproxy，VM 实例随 setup 回收）")
     }
   }
+  $keepIdx = @($keepIdx | Sort-Object)
+
+  # 参数将覆盖的保留项（-MySQL/-Redis 同名）：旧端口让位重分配，交互修改跳过之
+  $paramReplaceIdx = @()
+  foreach ($j in $keepIdx) {
+    foreach ($pn in @('mysql', 'redis')) {
+      $pv = @{ mysql = $MySQL; redis = $Redis }[$pn]
+      if (-not $pv -or $old[$j].name -ne $pn -or $paramReplaceIdx -contains $j) { continue }
+      $paramReplaceIdx += $j
+    }
+  }
+
+  # 交互修改保留项（2026-10-19）：改远端地址/显式改本地端口；未修改项沿用旧端口不重推导
+  $editIdx = @()
+  if ($keepIdx.Count -gt 0) {
+    $ans = (Read-Host '要修改的已有序号（回车跳过，逗号分隔）').Trim()
+    if ($ans -ne '') {
+      foreach ($tok in ($ans -split '[,，]')) {
+        $n = -1
+        if (-not [int]::TryParse($tok.Trim(), [ref]$n) -or $n -lt 1 -or $n -gt $old.Count) {
+          Die "修改序号无效：$tok（应为 1-$($old.Count)，或回车跳过）"
+        }
+        if ($keepIdx -notcontains ($n - 1)) { Die "序号 $n 未在保留列表中，不能修改（保留问答中未保留它）" }
+        if ($paramReplaceIdx -contains ($n - 1)) { Warn "序号 $n 由 -MySQL/-Redis 参数更新，跳过"; continue }
+        if ($editIdx -notcontains ($n - 1)) { $editIdx += ($n - 1) }
+      }
+    }
+  }
+  $editIdx = @($editIdx | Sort-Object)
+
+  # 阶段一：占用表——未修改且未被参数覆盖的保留项端口先入表（顺延避让依据）
+  $taken = @{}
+  $kept = @{}
+  $keptNameList = @()
+  foreach ($k in $keepIdx) {
+    $o = $old[$k]
+    $keptNameList += $o.name
+    if ($editIdx -contains $k -or $paramReplaceIdx -contains $k) { continue }
+    foreach ($p in @($o.hostPort, $o.vmPort)) {
+      if ($taken.ContainsKey($p)) { Die "relay.json 端口 $p 同时属于 $($taken[$p]) 与 $($o.name)，疑似手改损坏" }
+      $taken[$p] = $o.name
+    }
+    $kept[$k] = $o
+    $names[$o.name] = $true
+  }
+
+  # 阶段二：修改项按原序重分配（地址回车=保留原值；端口回车=自动顺延推导，数字=显式覆盖）
+  foreach ($k in $editIdx) {
+    $o = $old[$k]
+    $val = (Read-Host "新远端地址（回车保留 $($o.remoteHost):$($o.remotePort)）").Trim()
+    if (-not $val) { $val = "$($o.remoteHost):$($o.remotePort)" }
+    $np = (Read-Host '新本地端口（回车=自动推导；直接输入数字覆盖）').Trim()
+    if ($np -eq '') {
+      $obj = New-Service $o.name $val $taken
+      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
+    } else {
+      $pnum = 0
+      if (-not [int]::TryParse($np, [ref]$pnum)) { Die "$($o.name) 本地端口须为数字：$np" }
+      $obj = New-ServiceWithHostPort $o.name $val $pnum $taken
+      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)，显式指定）"
+    }
+    $kept[$k] = $obj
+    $names[$o.name] = $true
+  }
+
+  # 阶段三：按原序拼装保留/修改项（参数覆盖项移到参数位），再处理参数项与新增项
+  foreach ($k in $keepIdx) {
+    if ($paramReplaceIdx -contains $k) { continue }
+    $result += $kept[$k]
+  }
 
   foreach ($pn in @('mysql', 'redis')) {
     $val = @{ mysql = $MySQL; redis = $Redis }[$pn]
     if (-not $val) { continue }
-    $obj = New-Service $pn $val
+    $obj = New-Service $pn $val $taken
+    $verb = '参数新增'
+    if ($keptNameList -contains $pn) { $verb = '参数更新' }
     if ($names.ContainsKey($pn)) {
       for ($j = 0; $j -lt $result.Count; $j++) {
         if ($result[$j].name -eq $pn) { $result[$j] = $obj; break }
       }
-      Info "参数更新 $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
     } else {
       $names[$pn] = $true
       $result += $obj
-      Info "参数新增 $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
     }
+    $note = ''
+    if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
+    Info "$verb $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
   }
 
   $catNames = @($ServiceCatalog.Keys)
@@ -227,25 +350,25 @@ function Collect-Services($cfg) {
       $val = (Read-Host "远端 $newName 地址（IP:端口，域名暂不支持）").Trim()
       if (-not $val) { Warn "跳过 $newName（未提供地址）"; continue }
       $names[$newName] = $true
-      $result += (New-Service $newName $val)
+      $obj = New-Service $newName $val $taken
+      $note = ''
+      if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
+      Info "新增 $newName → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
+      $result += $obj
     } else {
       if ($catNames -notcontains $t) { Die "未知目录项：$t（目录：$($catNames -join ' ') 或 custom）" }
       if ($names.ContainsKey($t)) { Warn "$t 已在清单中，跳过（改地址：不保留该项后新增）"; continue }
       $val = (Read-Host "远端 $t 地址（例如 10.129.12.75:$($ServiceCatalog[$t])，IP:端口）").Trim()
       if (-not $val) { Warn "跳过 $t（未提供地址）"; continue }
       $names[$t] = $true
-      $result += (New-Service $t $val)
+      $obj = New-Service $t $val $taken
+      $note = ''
+      if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
+      Info "新增 $t → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
+      $result += $obj
     }
   }
 
-  # 端口冲突预检：不同服务不得推导/沿用相同 host/vm 端口（同远端端口必撞）
-  $seen = @{}
-  foreach ($s in $result) {
-    foreach ($p in @($s.hostPort, $s.vmPort)) {
-      if ($seen.ContainsKey($p)) { Die "端口 $p 同时属于 $($seen[$p]) 与 $($s.name)，请调整其一" }
-      $seen[$p] = $s.name
-    }
-  }
   if ($result.Count -eq 0) { Die '未配置任何服务（重跑 setup 须至少保留/新增一项；全部拆除请用 -Teardown）' }
   return $result
 }
@@ -373,7 +496,8 @@ function Invoke-Setup {
   }
 
   # 留痕（成功才落盘，teardown 按此精确回滚）
-  @{ version = 1; services = $services } | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii $RelayJson
+  $cfgOut = @{ version = 1; gateway = $gw; services = $services }
+  $cfgOut | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii $RelayJson
 
   # 存量安装目录的 .gitignore 可能早于 relay 存在：补一行防误提交内网 IP 配置
   $gi = Join-Path $InstallDir '.gitignore'
@@ -385,6 +509,24 @@ function Invoke-Setup {
   Info '完成。容器内应用连接地址（podman 网桥网关，稳定）：'
   foreach ($s in $services) { Write-Host "  $($s.name) → ${gw}:$($s.vmPort)" }
   if ($fail.Count -gt 0) { Warn "部分服务未通：$($fail -join '、')——先看 -Status 定位哪一跳" }
+}
+
+# ---- 配置清单（-List）：只读 relay.json 打印表格，不探活（探活是 -Status 的职责） ----
+function Invoke-List {
+  $cfg = Load-Config
+  if (-not $cfg) { Die "无 $RelayJson——通道未建立，先运行 setup（探活用 -Status）" }
+  $gw = $cfg.gateway
+  if (-not $gw) { $gw = Get-BridgeGateway }
+  Info '已配置通道（relay.json 留痕；探活请用 -Status）：'
+  $fmt = '  {0,-4} {1,-14} {2,-22} {3,-21} {4}'
+  Write-Host ($fmt -f '序号', '服务名', '远端地址', 'Windows portproxy', '容器连接地址')
+  $i = 0
+  foreach ($s in @($cfg.services)) {
+    $i++
+    $remote = "$($s.remoteHost):$($s.remotePort)"
+    $line = $fmt -f $i, $s.name, $remote, "127.0.0.1:$($s.hostPort)", "${gw}:$($s.vmPort)"
+    Write-Host $line
+  }
 }
 
 # ---- 状态查询：逐跳 ----
@@ -442,9 +584,14 @@ function Invoke-Teardown {
 
 # ---- 入口 ----
 try {
-  if ($Status -and $Teardown) { Die '-Status 与 -Teardown 互斥' }
+  $picked = @()
+  if ($Status) { $picked += 'Status' }
+  if ($Teardown) { $picked += 'Teardown' }
+  if ($List) { $picked += 'List' }
+  if ($picked.Count -gt 1) { Die ('开关互斥，只能选一：-' + ($picked -join ' -')) }
   if ($Status)   { Invoke-Status; exit 0 }
   if ($Teardown) { Invoke-Teardown; exit 0 }
+  if ($List)     { Invoke-List; exit 0 }
   Invoke-Setup
   exit 0
 } catch {

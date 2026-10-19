@@ -324,6 +324,7 @@ PowerShell 执行即可（脚本自动请求管理员提权）：
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1            # setup（问答）
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status    # 逐跳体检
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -List      # 查看已配置服务表
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称拆除
 ```
 
@@ -336,12 +337,13 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 ```
 
 **首次问答（重跑 setup 即更新）**：先回显已有通道（编号，首跑无此步）并问「保留
-已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）」；再问「可新增（目录：
-mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）」与「新增（多项逗号
-分隔，如 kafka,zookeeper 或 custom）」，目录项逐项追问远端地址（如「远端 kafka 地址
-（例如 10.129.12.75:9092，IP:端口）」），`custom` 先问「自定义服务名（限字母数字与
-`_-`，如 es7、db2-prod）」再问地址。`-MySQL`/`-Redis` 参数仍可直给（清单中同名则
-改地址，没有则新增）。
+已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）」；已有通道时再问「要
+修改的已有序号（回车跳过，逗号分隔）」逐项改地址/改本地端口（见下「改 IP / 改本地
+端口」）；最后问「可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；
+回车跳过）」与「新增（多项逗号分隔，如 kafka,zookeeper 或 custom）」，目录项逐项
+追问远端地址（如「远端 kafka 地址（例如 10.129.12.75:9092，IP:端口）」），`custom`
+先问「自定义服务名（限字母数字与 `_-`，如 es7、db2-prod）」再问地址。`-MySQL`/
+`-Redis` 参数仍可直给（清单中同名则改地址，没有则新增）。
 
 **删除/改端口行为**：被删或换端口的服务当场清 Windows 侧旧 portproxy；VM 侧
 systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable，未知 unit 一律
@@ -352,10 +354,10 @@ systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable
 → 写 Windows portproxy（仅 127.0.0.1）→ `podman machine cp` 三文件 → VM 侧
 `relay-vm.sh setup --retire` → 容器内探活。
 
-**服务目录与端口推导（2026-10-16）**：新增服务从目录多选——`mysql`、`redis`、
-`kafka`、`zookeeper`、`rabbitmq`（或 `custom` 自定义：服务名 + IP:端口，服务名
-限字母数字与 `_-`）。通道端口按**远端端口**统一推导，与存量 mysql/redis 通道
-完全兼容（旧 relay.json 无需迁移）：
+**服务目录与端口推导+自动顺延（2026-10-19 修订）**：新增服务从目录多选——`mysql`、
+`redis`、`kafka`、`zookeeper`、`rabbitmq`（或 `custom` 自定义：服务名 + IP:端口，
+服务名限字母数字与 `_-`）。通道端口按**远端端口**推导：hostPort=远端+10000、
+vmPort=hostPort+10000（存量 mysql/redis 值不变，旧 relay.json 无需迁移）：
 
 | 远端端口 | Windows portproxy | VM 中继监听 | 目录示例 |
 |---|---|---|---|
@@ -363,11 +365,17 @@ systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable
 | 6379 | 127.0.0.1:16379 | 网关:26379 | redis |
 | 9092 | 127.0.0.1:19092 | 网关:29092 | kafka |
 | 2181 | 127.0.0.1:12181 | 网关:22181 | zookeeper |
-| 任意 P | 127.0.0.1:P+10000 | 网关:P+20000 | 推导规则 |
+| 5672 | 127.0.0.1:15673（顺延） | 网关:25673 | rabbitmq（越过 15672） |
+| 任意 P | 127.0.0.1:P+10000 | 网关:P+20000（未顺延时） | 推导规则 |
 
-推导值恒 ≥10001，与 stack 自带发布端口天然错开；唯一例外：远端 rabbitmq 默认
-5672（+10000=15672 撞本地 rabbitmq 管理台）会被显式拒绝并说明原因——远端提供
-非 5672 端口即可。远端端口合法范围 1-45535（+20000 恰为 65535，不越界）。
+**多实例同远端端口自动顺延**：候选端口（host 或 vm 任一）命中已分配服务端口或本地
+stack 发布端口（3306/6379/5672/15672/9000/9001/3000/8080）时，hostPort/vmPort 同步
++1 重试（vmPort 恒为 hostPort+10000）。多套同类型环境可并存：`mysql`（远端 3306）→
+13306/23306，再配自定义 `mysql_log`（同远端 3306）→ 自动顺延到 13307/23307；远端
+rabbitmq 5672 → 越过本地管理台 15672 得 15673/25673（不再要求远端换端口）。分配按
+清单顺序（保留项在前、参数项次之、新增项最后）确定且重跑稳定；保留项沿用旧端口不
+重新推导。远端端口合法范围 1-45535；顺延后 hostPort 须 ≤55535（vmPort 恒 ≤65535），
+越界显式报错。实际分配端口在输出与 relay.json 中明示（顺延时带「自动顺延」标记）。
 
 **kafka 示例**（已有 mysql/redis，保留全部并新增 kafka 10.129.30.8:9092）：
 
@@ -382,8 +390,9 @@ systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable
 ```
 
 各服务先打印容器内探活结果（如 `mysql：容器 → 10.89.0.1:23306 OK`），全部成功后
-落盘配置留痕 `<安装目录>\relay.json`（services 动态长度）并打印容器内应用应使用的
-连接地址（podman 网桥网关，稳定，不随宿主 DHCP 变化）：
+落盘配置留痕 `<安装目录>\relay.json`（services 动态长度，另记录 `gateway` 供 `-List`
+免探测回显容器连接地址）并打印容器内应用应使用的连接地址（podman 网桥网关，稳定，
+不随宿主 DHCP 变化）：
 
 ```text
 [cadence-relay] 完成。容器内应用连接地址（podman 网桥网关，稳定）：
@@ -392,9 +401,41 @@ systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable
   kafka → 10.89.0.1:29092
 ```
 
+**改 IP / 改本地端口（2026-10-19）**：重跑 setup，保留问答之后会问「要修改的已有序号
+（回车跳过，逗号分隔）」，逐项先问「新远端地址（回车保留 原IP:端口）」再问「新本地
+端口（回车=自动推导；直接输入数字覆盖）」。只改地址则端口不变（无冲突时推导值=旧值）；
+显式输入端口须在 1-55535、不撞 stack 发布端口、不与其他服务重复（vmPort 恒为
+hostPort+10000，随显式值同步），违反则当场报错说明。未修改的保留项一律沿用旧端口。
+改 mysql 地址示例（换 IP、端口回车不动）：
+
+```text
+保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）: ⏎
+要修改的已有序号（回车跳过，逗号分隔）: 1
+新远端地址（回车保留 10.129.12.75:3306）: 10.129.20.88:3306
+新本地端口（回车=自动推导；直接输入数字覆盖）: ⏎
+[cadence-relay] 修改 mysql → 10.129.20.88:3306（host 13306 / vm 23306）
+```
+
+**`-List` 查看已配置通道（2026-10-19）**：只读 relay.json 打印服务表，**不探活**（探活
+用 `-Status`），与 `-Status`/`-Teardown` 互斥：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -List
+```
+
+```text
+[cadence-relay] 已配置通道（relay.json 留痕；探活请用 -Status）：
+  序号  服务名         远端地址             Windows portproxy    容器连接地址
+  1    mysql           10.129.12.75:3306       127.0.0.1:13306      10.89.0.1:23306
+  2    mysql_log       10.129.12.76:3306       127.0.0.1:13307      10.89.0.1:23307
+```
+
+无 relay.json 时报「通道未建立」。旧版 relay.json（无 `gateway` 字段）会现场解析网桥
+网关（需 stack 网络在）。
+
 **链路**（4 跳）：容器 → VM socat（绑网桥网关，每服务一个 systemd 单元）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；VM 侧 systemd 优先（`Restart=always` 自恢复），wsl.conf [boot] 兜底为 5 秒巡检的监督循环（等价自恢复；存在外来 [boot] 段时显式失败）。
 
-**注意**：VPN 断开则应用连不上（预期行为，status 可区分「VPN 未连」与「中继故障」）；端口与 stack 自带中间件按推导规则错开（如 mysql 本地 13306/容器侧 23306 vs stack 的 3306/6379），两套并存互不影响，例外撞点见上表说明；存量手搭中继占用端口时先 exit 3 报占用者、确认后仅精确接管。`relay-vm.sh teardown` 只清 VM 侧、不删 Windows portproxy（如需手工删除：`netsh interface portproxy delete v4tov4 listenport=13306` 等按端口精确删除）；`relay.ps1 -Teardown` 会连同两侧（portproxy 与 VM 实例）一起删除。
+**注意**：VPN 断开则应用连不上（预期行为，status 可区分「VPN 未连」与「中继故障」）；端口与 stack 自带中间件按推导规则错开（如 mysql 本地 13306/容器侧 23306 vs stack 的 3306/6379），推导撞 stack 发布端口时自动顺延越过（如远端 rabbitmq 5672 → 15673/25673）；存量手搭中继占用端口时先 exit 3 报占用者、确认后仅精确接管。`relay-vm.sh teardown` 只清 VM 侧、不删 Windows portproxy（如需手工删除：`netsh interface portproxy delete v4tov4 listenport=13306` 等按端口精确删除）；`relay.ps1 -Teardown` 会连同两侧（portproxy 与 VM 实例）一起删除。
 
 #### 备用入口：交互 WSL 窗口（排查或无 PowerShell 场景）
 
