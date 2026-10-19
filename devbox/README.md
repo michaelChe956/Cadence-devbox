@@ -313,9 +313,92 @@ stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适�
 
 > 适用：中间件在**公司内网**、只能从 Windows 宿主经 VPN（如 aTrust）访问——容器直连 VPN 网段不通（VPN 丢弃一切 NAT 转发流量，实测定论）。基于真机验证链路产品化，完整设计见 OpenSpec `add-remote-middleware-relay`。
 >
-> **状态（2026-10-14）**：链路已真机端到端验证（容器内 MySQL `SELECT 1` 返回 1、Redis `PING` 返回 `PONG`）；本手册交付的固化形态为**每服务一个 systemd 单元**（`cadence-relay@mysql`/`cadence-relay@redis`，单服务故障互不影响、开机自恢复）。**固化入口 = 交互 WSL 窗口直接执行 `relay-vm.sh`（见下；脚本本身的真机固化执行与验收 = OpenSpec tasks 1.4，尚未执行）**。`relay.ps1` 一键入口在维护者机存在「零输出 exit 0」问题（BOM/解析/提权已排除，根因未定），修复前勿依赖；其参数与 VM 脚本保持兼容，失败会显式报错而非静默。
+> **状态（2026-10-19）**：链路与一键入口均已真机验收通过。**主入口 = `relay.ps1`（仓库根目录一条命令，见下）**；固化形态仍为**每服务一个 systemd 单元**（`cadence-relay@mysql`/`cadence-relay@redis`，单服务故障互不影响、开机自恢复）。验收证据：多通道 setup 一次拉通、`-Status` 逐跳全部 OK、`-Teardown` 对称拆除后重建成功；容器内协议级实测 MySQL `SELECT 1=1`、Redis `PING` 返回 `PONG`。
 
-#### 固化入口：交互 WSL 窗口（在已验证链路上执行，脚本待 1.4 真机验收）
+#### 一键入口 relay.ps1（推荐）
+
+**状态（2026-10-19，WinPS 5.1 真机验收通过）**：多通道 setup（新增/删除/改址）、
+`-Status` 逐跳体检、`-Teardown` 拆除与拆除后重建均已完整跑通。在仓库根目录打开
+PowerShell 执行即可（脚本自动请求管理员提权）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1            # setup（问答）
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status    # 逐跳体检
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称拆除
+```
+
+**`-InstallDir <目录>`**：安装目录（`install.ps1` 装出的 `cadence` 目录，`relay.json`
+落在这里），默认 = 仓库父目录下的 `cadence`。仓库克隆在子目录、安装目录在别处时
+**必须显式指定**（维护者机即此情况）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testpodman\cadence
+```
+
+**首次问答（重跑 setup 即更新）**：先回显已有通道（编号，首跑无此步）并问「保留
+已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）」；再问「可新增（目录：
+mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）」与「新增（多项逗号
+分隔，如 kafka,zookeeper 或 custom）」，目录项逐项追问远端地址（如「远端 kafka 地址
+（例如 10.129.12.75:9092，IP:端口）」），`custom` 先问「自定义服务名（限字母数字与
+`_-`，如 es7、db2-prod）」再问地址。`-MySQL`/`-Redis` 参数仍可直给（清单中同名则
+改地址，没有则新增）。
+
+**删除/改端口行为**：被删或换端口的服务当场清 Windows 侧旧 portproxy；VM 侧
+systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable，未知 unit 一律
+不动）；无 systemd 的 boot 兜底模式下由 setup 按旧服务表对账（`--retire`，三参
+核验一致的旧监听精确回收，未知不动）。
+
+**运行顺序**：远端可达预检（VPN 未连即报错退出、零改动）→ 读 podman 网桥网关
+→ 写 Windows portproxy（仅 127.0.0.1）→ `podman machine cp` 三文件 → VM 侧
+`relay-vm.sh setup --retire` → 容器内探活。
+
+**服务目录与端口推导（2026-10-16）**：新增服务从目录多选——`mysql`、`redis`、
+`kafka`、`zookeeper`、`rabbitmq`（或 `custom` 自定义：服务名 + IP:端口，服务名
+限字母数字与 `_-`）。通道端口按**远端端口**统一推导，与存量 mysql/redis 通道
+完全兼容（旧 relay.json 无需迁移）：
+
+| 远端端口 | Windows portproxy | VM 中继监听 | 目录示例 |
+|---|---|---|---|
+| 3306 | 127.0.0.1:13306 | 网关:23306 | mysql |
+| 6379 | 127.0.0.1:16379 | 网关:26379 | redis |
+| 9092 | 127.0.0.1:19092 | 网关:29092 | kafka |
+| 2181 | 127.0.0.1:12181 | 网关:22181 | zookeeper |
+| 任意 P | 127.0.0.1:P+10000 | 网关:P+20000 | 推导规则 |
+
+推导值恒 ≥10001，与 stack 自带发布端口天然错开；唯一例外：远端 rabbitmq 默认
+5672（+10000=15672 撞本地 rabbitmq 管理台）会被显式拒绝并说明原因——远端提供
+非 5672 端口即可。远端端口合法范围 1-45535（+20000 恰为 65535，不越界）。
+
+**kafka 示例**（已有 mysql/redis，保留全部并新增 kafka 10.129.30.8:9092）：
+
+```text
+[cadence-relay] 已有通道（编号）：
+  1. mysql → 10.129.12.75:3306（host 13306 / vm 23306）
+  2. redis → 10.129.20.31:6379（host 16379 / vm 26379）
+保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）: ⏎
+[cadence-relay] 可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）
+新增（多项逗号分隔，如 kafka,zookeeper 或 custom）: kafka
+远端 kafka 地址（例如 10.129.12.75:9092，IP:端口）: 10.129.30.8:9092
+```
+
+各服务先打印容器内探活结果（如 `mysql：容器 → 10.89.0.1:23306 OK`），全部成功后
+落盘配置留痕 `<安装目录>\relay.json`（services 动态长度）并打印容器内应用应使用的
+连接地址（podman 网桥网关，稳定，不随宿主 DHCP 变化）：
+
+```text
+[cadence-relay] 完成。容器内应用连接地址（podman 网桥网关，稳定）：
+  mysql → 10.89.0.1:23306
+  redis → 10.89.0.1:26379
+  kafka → 10.89.0.1:29092
+```
+
+**链路**（4 跳）：容器 → VM socat（绑网桥网关，每服务一个 systemd 单元）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；VM 侧 systemd 优先（`Restart=always` 自恢复），wsl.conf [boot] 兜底为 5 秒巡检的监督循环（等价自恢复；存在外来 [boot] 段时显式失败）。
+
+**注意**：VPN 断开则应用连不上（预期行为，status 可区分「VPN 未连」与「中继故障」）；端口与 stack 自带中间件按推导规则错开（如 mysql 本地 13306/容器侧 23306 vs stack 的 3306/6379），两套并存互不影响，例外撞点见上表说明；存量手搭中继占用端口时先 exit 3 报占用者、确认后仅精确接管。`relay-vm.sh teardown` 只清 VM 侧、不删 Windows portproxy（如需手工删除：`netsh interface portproxy delete v4tov4 listenport=13306` 等按端口精确删除）；`relay.ps1 -Teardown` 会连同两侧（portproxy 与 VM 实例）一起删除。
+
+#### 备用入口：交互 WSL 窗口（排查或无 PowerShell 场景）
+
+> 一键入口不可用 / 需手工排查时使用；正常场景优先用上面的 `relay.ps1`。
 
 前提：Windows 侧 portproxy 已按服务表建好（127.0.0.1:13306/16379 → VPN 侧远端）、stack 已起（§2.4）、podman 网桥网关存在——`podman network inspect cadence_default` 查 `Gateway`（下例 10.89.0.1，按实际替换）。
 
@@ -360,68 +443,13 @@ podman exec devbox redis-cli -h 10.89.0.1 -p 26379 --askpass PING
 bash "$S" teardown
 ```
 
-#### 一键入口 relay.ps1（问题未定，暂勿依赖）
+#### 排障：零输出退出
 
-维护者机实测存在零输出退出问题（根因未定，调查暂停）；2026-10-16 已按多服务
-目录交互改造，待维护者还原环境后实机重测取证。修复并真机验收前，请用上面的
-交互 WSL 路线。命令与行为契约保留（setup/status/teardown 与 VM 脚本参数兼容；
-占用时 exit 3、确认后 `--force`）：
+现象：执行 `relay.ps1` 后**没有任何输出**，进程直接结束，退出码 0（看起来像「没反应」）。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1            # setup
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Status    # 逐跳体检
-powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称拆除
-```
+成因：终端管控/EDR 按脚本内容特征静默终止进程——2026-10-19 定案为脚本内 `TcpClient` 字面量触发；该写法已移除（改用 `System.Net.Sockets.Socket`，并有测试钉住字面量不再出现），此后真机未再复现。
 
-**服务目录与端口推导（2026-10-16）**：新增服务从目录多选——`mysql`、`redis`、
-`kafka`、`zookeeper`、`rabbitmq`（或 `custom` 自定义：服务名 + IP:端口，服务名
-限字母数字与 `_-`）。通道端口按**远端端口**统一推导，与存量 mysql/redis 通道
-完全兼容（旧 relay.json 无需迁移）：
-
-| 远端端口 | Windows portproxy | VM 中继监听 | 目录示例 |
-|---|---|---|---|
-| 3306 | 127.0.0.1:13306 | 网关:23306 | mysql |
-| 6379 | 127.0.0.1:16379 | 网关:26379 | redis |
-| 9092 | 127.0.0.1:19092 | 网关:29092 | kafka |
-| 2181 | 127.0.0.1:12181 | 网关:22181 | zookeeper |
-| 任意 P | 127.0.0.1:P+10000 | 网关:P+20000 | 推导规则 |
-
-推导值恒 ≥10001，与 stack 自带发布端口天然错开；唯一例外：远端 rabbitmq 默认
-5672（+10000=15672 撞本地 rabbitmq 管理台）会被显式拒绝并说明原因——远端提供
-非 5672 端口即可。远端端口合法范围 1-45535（+20000 恰为 65535，不越界）。
-
-**交互（重跑 setup）**：先回显已有通道（编号），「回车=全部保留，a=全部删除，
-逗号分隔=仅保留所列」；再问新增（目录项逗号分隔或 `custom`，回车跳过），逐项
-问远端 IP:端口；`-MySQL`/`-Redis` 参数仍可直给（清单中同名则改地址，没有则
-新增）。**删除/改端口行为**：被删或换端口的服务当场清 Windows 侧旧 portproxy；
-VM 侧 systemd 实例由本次 setup 按新服务表回收（所有权核验后 disable，未知
-unit 一律不动）；无 systemd 的 boot 兜底模式下由 setup 按旧服务表对账
-（`--retire`，三参核验一致的旧监听精确回收，未知不动）。
-
-**kafka 示例**（已有 mysql/redis，保留全部并新增 kafka 10.129.30.8:9092）：
-
-```text
-[cadence-relay] 已有通道（编号）：
-  1. mysql → 10.129.12.75:3306（host 13306 / vm 23306）
-  2. redis → 10.129.20.31:6379（host 16379 / vm 26379）
-保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）: ⏎
-[cadence-relay] 可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）
-新增（多项逗号分隔，如 kafka,zookeeper 或 custom）: kafka
-远端 kafka 地址（例如 10.129.12.75:9092，IP:端口）: 10.129.30.8:9092
-```
-
-完成后落盘配置留痕 `<安装目录>\relay.json`（services 动态长度），并打印容器内
-应用应使用的连接地址（podman 网桥网关，稳定，不随宿主 DHCP 变化）：
-
-```text
-mysql → 10.89.0.1:23306
-redis → 10.89.0.1:26379
-kafka → 10.89.0.1:29092
-```
-
-**链路**（4 跳）：容器 → VM socat（绑网桥网关，每服务一个 systemd 单元）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；VM 侧 systemd 优先（`Restart=always` 自恢复），wsl.conf [boot] 兜底为 5 秒巡检的监督循环（等价自恢复；存在外来 [boot] 段时显式失败）。
-
-**注意**：VPN 断开则应用连不上（预期行为，status 可区分「VPN 未连」与「中继故障」）；端口与 stack 自带中间件按推导规则错开（如 mysql 本地 13306/容器侧 23306 vs stack 的 3306/6379），两套并存互不影响，例外撞点见上表说明；存量手搭中继占用端口时先 exit 3 报占用者、确认后仅精确接管。VM 侧 teardown 不删 Windows portproxy 规则（如需删除在 Windows 侧 `netsh interface portproxy delete v4tov4 listenport=13306` 等按端口精确删除）。
+自查：先跑 `-Status`，看脚本能否正常出声——能打印说明脚本本身正常，问题在提权或某一跳，按输出逐跳定位；若仍零输出，记录终端管控/EDR 的拦截日志（时间点、进程名、规则名/策略名）并反馈。**反馈前不要**自行关闭防护或加白名单。
 
 ## 3. 日常使用
 
