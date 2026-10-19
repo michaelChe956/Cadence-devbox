@@ -196,7 +196,7 @@ Write-Host @"
   1. 进入容器：podman exec -it devbox bash
      首验：claude --version && stack status && ls /workspace
   2. 你的全部仓库在容器内 /workspace 下，与 Windows 双向同步
-  3. 换 key/换模型：改 $InstallDir\cadence-box.yaml → podman restart devbox
+  3. 换 key/换模型：改 $InstallDir\cadence-box.yaml → podman stop devbox + podman start devbox（勿用 restart）
   4. 加开中间件（容器内）：stack enable mq   # rabbitmq；stack enable storage   # minio
   5. 日常开关：podman stop devbox / podman start devbox（machine 随 Podman Desktop 起）
   6. 要连公司远端中间件（VPN 侧 MySQL/Redis）：.\devbox\relay.ps1（手册 §2.6）

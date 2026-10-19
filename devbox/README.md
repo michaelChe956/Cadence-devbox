@@ -246,7 +246,7 @@ agents:
   omp:    { provider: relay1, model: glm-5.3 }
 ```
 
-> ⚠️ 此文件=密钥，勿提交勿分享。换 key/换模型改这里，`podman restart devbox` 生效。
+> ⚠️ 此文件=密钥，勿提交勿分享。换 key/换模型改这里，**`podman stop devbox` + `podman start devbox` 生效**（实测 `podman restart` 不会重跑 entrypoint 渲染，配置不生效）。
 
 ### 2.4 启动与首验（podman 拓扑）
 
@@ -457,7 +457,7 @@ bash "$S" teardown
 |---|---|
 | 每天开工 | `podman-compose -f compose.yaml up -d`（在 stack 目录；二次启动秒级）+ `podman start devbox` |
 | 进入容器 | `podman exec -it devbox bash`，然后直接 `claude` / `codex` / `pi` / `kimi` / `omp` |
-| 换 key/换模型 | 改 `..\cadence-box.yaml` → `podman restart devbox` |
+| 换 key/换模型 | 改 `..\cadence-box.yaml` → `podman stop devbox` + `podman start devbox`（勿用 `restart`，实测不重渲染） |
 | 中间件增删启停 | 容器内 `stack` 命令（见 §4），或直接对 agent 说「加个 kafka」「重启 mysql」 |
 | 跑项目 | 容器内 `app run myapp -- mvn spring-boot:run`（后台+日志+端口探活），或让 agent 全权 |
 | 切 JDK 版本 | 容器内 `jdk list` / `jdk use 8` / `jdk use 21`（见 §3.1；默认内置 Temurin 21，选择跨重建保留） |
