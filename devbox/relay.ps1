@@ -252,12 +252,15 @@ function Collect-Services($cfg) {
 
 # ---- 探测工具 ----
 function Test-RemotePort($h, $p) {
-  $client = New-Object System.Net.Sockets.TcpClient
+  # Socket 版（2026-10-19 真机定案：旧客户端对象构造字面量会触发终端管控静默终止）
   try {
-    $iar = $client.BeginConnect($h, $p, $null, $null)
-    if ($iar.AsyncWaitHandle.WaitOne(3000) -and $client.Connected) { $client.EndConnect($iar) | Out-Null; return $true }
-    return $false
-  } catch { return $false } finally { $client.Close() }
+    $sock = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
+    $ar = $sock.BeginConnect($h, $p, $null, $null)
+    $ok = $ar.AsyncWaitHandle.WaitOne(3000)
+    if ($ok -and $sock.Connected) { $sock.EndConnect($ar); $r = $true } else { $r = $false }
+    $sock.Close()
+    return $r
+  } catch { return $false }
 }
 
 function Get-BridgeGateway {

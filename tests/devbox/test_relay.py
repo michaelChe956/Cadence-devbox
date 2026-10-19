@@ -60,7 +60,8 @@ def test_relay_ps1_guards():
     text = RELAY_PS1.read_text(encoding="utf-8")
     assert "RunAs" in text, "缺管理员自提升（RunAs）"
     assert "wsl" in text, "缺 WSL 后端守卫"
-    assert "TcpClient" in text, "缺远端预检 TcpClient"
+    assert "System.Net.Sockets.Socket" in text, "缺远端预检 Socket"
+    assert "TcpClient" not in text, "远端预检残留 TcpClient 字面量（会触发终端管控静默终止）"
 
 
 def test_relay_ports_no_overlap():

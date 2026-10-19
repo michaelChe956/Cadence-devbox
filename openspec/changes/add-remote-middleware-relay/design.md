@@ -68,7 +68,7 @@ boot 兜底（systemd 不可用时）：`/usr/local/bin/cadence-relay-boot` 为�
 
 ### D5. 前置自检与顺序
 
-setup 执行顺序固定：平台守卫（`podman machine inspect` Provider 必须 wsl 且 Running）→ 管理员检测（非管理员时自动 `-Verb RunAs` 重启自身，失败则 Die）→ 远端可达性探测（`TcpClient` 3 秒超时，逐服务）→ 任何失败在改动前终止，不留半配置。`-Status` 同样逐跳探测：portproxy 规则存在性（解析 `netsh interface portproxy show all`）→ VM 监听（`ss -tln` 按端口）→ 容器内 `/dev/tcp` 探活 → 宿主到远端可达性；远端不通而中继正常时报"VPN 未连"。
+setup 执行顺序固定：平台守卫（`podman machine inspect` Provider 必须 wsl 且 Running）→ 管理员检测（非管理员时自动 `-Verb RunAs` 重启自身，失败则 Die）→ 远端可达性探测（`Socket` BeginConnect 3 秒超时，逐服务；2026-10-19 真机定案：旧客户端对象构造字面量会触发终端管控静默终止，故弃用）→ 任何失败在改动前终止，不留半配置。`-Status` 同样逐跳探测：portproxy 规则存在性（解析 `netsh interface portproxy show all`）→ VM 监听（`ss -tln` 按端口）→ 容器内 `/dev/tcp` 探活 → 宿主到远端可达性；远端不通而中继正常时报"VPN 未连"。
 
 ### D6. 连接地址：podman 网桥网关
 
