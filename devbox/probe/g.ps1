@@ -1,5 +1,4 @@
-﻿﻿# cadence relay 宿主侧一键脚本：容器 → VM socat → mirrored 回环 → Windows portproxy → VPN → 远端中间件
-# 设计与排障背景见 openspec/changes/add-remote-middleware-relay/ 与手册 devbox/README.md §2.6。
+﻿# 设计与排障背景见 openspec/changes/add-remote-middleware-relay/ 与手册 devbox/README.md §2.6。
 # 用法（仓库根目录打开 PowerShell，管理员自动提升）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1                       # 拉通/更新（问答）
 #   powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -MySQL 10.x.x.x:3306  # 指定 mysql（新增/改址）
@@ -13,4 +12,5 @@ param(
   [string]$Redis = "",
   [string]$InstallDir = ""
 )
+$ErrorActionPreference = 'Stop'
 Write-Host "PROBE-G-OK"
