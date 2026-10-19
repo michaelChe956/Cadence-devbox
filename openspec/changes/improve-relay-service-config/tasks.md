@@ -20,8 +20,8 @@
 - [x] 4.1 devbox/README.md §2.6：推导表加 rabbitmq 顺延行与多实例顺延说明（显式拒绝改为自动顺延）、`-List` 用法与示例输出、改址/改端口交互流程示例、relay.json gateway 说明
 - [x] 4.2 同步 cadence/plans/ 实施计划文档（含 controller 统一执行的 pytest 验证命令清单），自查 PS 硬约束（UTF-8 BOM+LF、新增行 ≤100 字符、无 here-string、无 TcpClient 字面量）
 
-## 5. Controller 验收（统一执行，未跑）
+## 5. Controller 验收（已完成）
 
-- [ ] 5.1 `python -m pytest tests/devbox/test_relay.py -v`（红→绿全量回归；VmSandbox 组依赖 POSIX /proc 环境，pwsh 行为组依赖本机 pwsh）
-- [ ] 5.2 `bash -n devbox/relay-vm.sh`（未动，应仍过）与 `openspec validate improve-relay-service-config`
-- [ ] 5.3 真机（维护者 Windows）：`relay.ps1 -List`、双 3306 场景 setup、改址重跑、`-Status`/`-Teardown` 回归
+- [x] 5.1 `python -m pytest tests/devbox` → **150 passed**（controller 实跑，含 VmSandbox 与 pwsh 行为组；含修复 Int64/Int32 探针失配后复跑）
+- [x] 5.2 `bash -n devbox/relay-vm.sh` 通过（未动）与 `openspec validate improve-relay-service-config` 通过（controller 实跑）
+- [x] 5.3 维护者 Windows 真机确认通过（2026-10-19）：`-List`、双 3306 顺延 setup、改址重跑、`-Status`/`-Teardown` 回归
