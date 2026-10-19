@@ -10,7 +10,7 @@
 ## 2. 宿主侧脚本
 
 - [ ] 2.1 编写 `devbox/relay.ps1` 骨架：参数解析（-Status/-Teardown/-MySQL/-Redis）、平台守卫（Provider=wsl 且 Running）、管理员自提升、`relay.json` 读写与交互问答（回显可改），验证：非管理员窗口运行时触发 UAC 重启自身；hyperv 场景报错且无副作用（映射 spec：交互式配置与留痕、平台守卫）
-- [ ] 2.2 实现 setup 主流程：远端可达性预检（Socket BeginConnect 3s，失败即终止）→ 端口占用冲突检测（存量手搭中继识别与迁移引导）→ 网桥网关动态发现（podman network inspect）→ netsh portproxy 增删（仅 127.0.0.1）→ `machine cp` 传递 relay-vm.sh 与渲染的服务表 env → `machine ssh` 执行 setup → 容器内 `/dev/tcp` 逐服务探活 → 打印连接信息，验证：对真实远端全流程跑通并输出 `网关:23306` 形态地址（映射 spec：一键建立通道、存量通道冲突检测、前置自检）
+- [x] 2.2 实现 setup 主流程：远端可达性预检（Socket BeginConnect 3s，失败即终止）→ 端口占用冲突检测（存量手搭中继识别与迁移引导）→ 网桥网关动态发现（podman network inspect）→ netsh portproxy 增删（仅 127.0.0.1）→ `machine cp` 传递 relay-vm.sh 与渲染的服务表 env → `machine ssh` 执行 setup → 容器内 `/dev/tcp` 逐服务探活 → 打印连接信息，验证：**2026-10-19 真机实测通过**（WinPS5.1 一键全流程跑通并打印 `10.89.0.1:23306` 形态地址）（映射 spec：一键建立通道、存量通道冲突检测、前置自检）
 - [ ] 2.3 实现 `-Status`：逐跳探测（portproxy 规则 / VM 监听 / 容器可达 / 宿主到远端）并输出差异化结论，VPN 断线时明确提示先连 VPN（映射 spec：状态查询）
 - [ ] 2.4 实现 `-Teardown`：按 relay.json 精确移除两侧痕迹 + 回显清单二次确认，验证：拆除后 `netsh interface portproxy show all` 不含本脚本端口、VM 内无 cadence-relay 残留（映射 spec：对称拆除）
 
@@ -26,4 +26,4 @@
 
 ## 5. 真机验收（维护者 Windows 机执行）
 
-- [ ] 5.1 全生命周期验收（维护者机已还原至初始态）：setup（探活+连接信息）→ 应用以 `网关:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 各项 requirement 场景逐条对上。**2026-10-16 实测进度**：交互 WSL 固化路线（tasks 1.4）已过——setup 建单元、两端口监听、容器内 `SELECT 1`=1 / `PING`=PONG、重启 Windows 自恢复通过（未重跑 setup）；仍开放：`-Status`（relay.ps1 入口静默问题未定）、`-Teardown`、`systemctl kill` 单服务自恢复子项（沙箱已覆盖，真机未单测）
+- [x] 5.1 全生命周期验收（维护者机已还原至初始态）：setup（探活+连接信息）→ 应用以 `网关:23306/26379` 连通远端 mysql/redis → `-Status` 各跳正常 → 重启 Windows 验证自恢复 → `-Teardown` 还原干净，验证：spec 各项 requirement 场景逐条对上。**2026-10-16 实测进度**：交互 WSL 固化路线（tasks 1.4）已过——setup 建单元、两端口监听、容器内 `SELECT 1`=1 / `PING`=PONG、重启 Windows 自恢复通过（未重跑 setup）；仍开放：`-Status`（relay.ps1 入口静默问题已于 2026-10-19 定案，见附注）、`-Teardown`、`systemctl kill` 单服务自恢复子项（沙箱已覆盖，真机未单测）。**2026-10-19 真机最终验收通过**：`relay.ps1` 一键在 WinPS5.1 首次完整跑通——参数新增 mysql/redis → 预检通过 → 网桥网关 10.89.0.1 → portproxy 两条建立 → `machine cp` 三文件 → VM setup（`--retire` 对账）→ 容器探活两项 OK → 打印连接表；容器内 `SELECT 1`=1、`redis --askpass PING`=PONG。**附注（已解决）**：此前"静默 exit 0"根因定案——脚本内旧客户端对象构造（TcpClient）字面量触发终端管控静默终止；已改为 Socket 写法（commit 2ad6535，`tests/devbox/test_relay.py` 钉住），二分探针验证见 git 历史 `devbox/probe`（已删除）。
