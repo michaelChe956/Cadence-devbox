@@ -346,7 +346,63 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称�
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testpodman\cadence
 ```
 
-**setup 运行顺序**：远端可达预检（VPN 未连即报错退出、零改动）→ 读 podman 网桥网关 → 写 Windows portproxy（仅 127.0.0.1）→ `podman machine cp` 三文件 → VM 侧 `relay-vm.sh setup --retire` → 容器内探活 → 全部成功才落盘 relay.json。
+**setup 运行顺序**：远端可达预检（VPN 未连即报错退出、零改动）→ 读 podman 网桥网关 → 写 Windows portproxy（仅 127.0.0.1）→ 生成 DNAT 映射表（Windows 安装目录与 VM 侧各一份，见下节）→ `podman machine cp` 四文件 → VM 侧 `relay-vm.sh setup --retire`（末尾自动应用 DNAT 规则）→ 容器内探活 → 全部成功才落盘 relay.json。
+
+#### 透明地址映射：容器内直接用真实 IP:端口
+
+> 状态（2026-10-20）：机制与命令形态已在维护者 Windows 真机探路验证（容器内对真实地址连通，探针输出 `CONNECT-OK`）；随 relay.ps1 setup 自动启用，**无独立开关、无新命令**。
+
+**解决什么问题**：应用里写的常是公司内网**真实地址**（如 `10.129.12.75:3306`）——从配置中心拉配置的 Spring 工程尤其改不得。而容器直连这类地址不通（VPN 丢弃 NAT 转发流量，只有 Windows 宿主发起的连接被放行）。启用本能力后，**容器内照旧写真实地址即可连通**：不改工程代码、不改配置中心数据、不改容器镜像/compose，`application.yml` 里的 `10.129.12.75:3306` 原样能连。
+
+**怎么工作**：relay 通道就绪后，VM 里多一张 nft DNAT 表——容器**发往真实地址**的包进入 VM 协议栈时，被无状态改写到 relay 已有的桥接监听地址（socat 实际监听的 `网关:vmPort`），其后与 §2.6 链路完全复用：
+
+```text
+容器（照旧连 10.129.12.75:3306）
+  → VM nft DNAT：目标改写为 10.89.0.1:23306（relay 桥接监听）
+  → VM socat（网关:23306）→ mirrored 回环 127.0.0.1:13306
+  → Windows portproxy → VPN → 远端 10.129.12.75:3306
+```
+
+规则全部挂在自建 `table ip cadence_dnat`（priority `dstnat - 1`，早于 podman 自带 netavark 的标准 dstnat 链，确保先改写），不碰系统其它规则；容器零特权、零改动，容器重启/重建不影响（规则在 VM 内核态，与容器生命周期无关）。
+
+**开启方式**：就是跑一次本节开头的 `relay.ps1` setup——同一入口、同一份配置，无新命令、无新配置文件。setup 会生成**映射表**（每行 `<服务名> <真实IP> <真实端口> <网关> <vmPort> [域名]`），一份落 `<安装目录>\stack\data\relay-map.env`，一份下发 VM `/etc/cadence-relay-dnat.env`；VM 侧 setup 末尾按表应用规则（此步失败只告警，不回滚已就绪的 relay 通道）。映射表是 relay.json 的派生物，勿手改。
+
+**地址问句带域名**：录入远端地址的问句从 `IP:端口` 扩为 `IP:端口[ 域名]`——域名是同一问句的可选第二段，不二次询问、可留空。域名仅落盘留痕（relay.json 的 `host` 字段），供诊断核对与后续域名场景，**不参与 DNAT 规则生成**（规则只按 IP 匹配）。三种真实形态：
+
+```text
+远端 kafka 地址（例如 10.129.12.75:9092，IP:端口[ 域名]）: 10.129.30.8:9092
+远端 mysql 地址（例如 10.129.12.75:3306，IP:端口[ 域名]）: 10.129.12.75:3306 mysql.corp.local
+新远端地址（IP:端口[ 域名]，回车保留 10.129.12.75:3306 mysql.corp.local）: 10.129.20.88:3306 -
+```
+
+第三行是修改已有服务：只输入地址、不带域名段 = 域名**保持原值**；要清空已录域名须显式给 `-` 或 `none`（直接回车 = 地址与域名都保持原值，清空必须有显式入口）。域名与地址同场校验，写错当场报错。
+
+**重启后自动恢复**：nft 规则在内核态、VM 重启即丢——固化由 VM 侧负责：systemd 可用时新建单元 `cadence-relay-dnat.service`（oneshot 开机重放、ExecStop 清表）；systemd 不可用时复用既有 wsl.conf [boot] 监督循环（每轮先幂等重放规则、再巡检监听）。宿主/VM 重启后规则自动重建，**无需重跑 setup**；容器重启更无影响。查看固化状态（输出 `enabled` + `active` 即正常；boot 兜底环境无此单元，直接看下面的规则自检）：
+
+```powershell
+podman machine ssh 'systemctl is-enabled cadence-relay-dnat; systemctl is-active cadence-relay-dnat'
+```
+
+**怎么确认生效**：`relay.ps1 -Status` 的 VM 侧输出末尾多一段 DNAT 诊断——规则表是否存在、逐条 `真实地址 → 网关:vmPort` 是否齐全、映射表与 relay 服务表是否一致、网关是否漂移：
+
+```text
+[cadence-relay] DNAT: mysql 10.129.12.75:3306 → 10.89.0.1:23306 OK
+[cadence-relay] DNAT: redis 10.129.20.31:6379 → 10.89.0.1:26379 OK
+```
+
+容器内自检（`podman exec -it devbox bash` 进入后执行；对真实地址发一个 TCP 探针，输出 `CONNECT-OK` 即 DNAT 已接管，之后应用/JDBC 照旧连真实地址）：
+
+```bash
+if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo CONNECT-OK; else echo CONNECT-FAIL; fi
+```
+
+**怎么撤销**：`relay.ps1 -Teardown` 对称拆除——连同 DNAT 规则、VM 侧单元与两份映射表一起清。只想在 VM 侧手工回滚规则本身时（只删自有表、幂等、真机验证过的形态）：
+
+```powershell
+podman machine ssh 'sudo nft delete table ip cadence_dnat'
+```
+
+**注意（真机踩过的坑）**：VM（Fedora podman machine）内**只有 nft、没有 iptables**——本能力用 nft 实现，不需要也不要求装 iptables。若要手工加规则：先把规则写成 `.nft` 文件（**LF 行尾**，CRLF 会被 nft 拒绝）送进 VM 后用 `sudo nft -f 文件` 加载；**不要**在 `podman machine ssh` 命令行里敲 `nft add chain ... '{ type nat hook ... }'`——花括号里的空格与分号经 Windows → bash 引号层传递会被吃掉而报语法错（真机踩过）。脚本内部即按「写临时 .nft 文件 → `nft -f`」实现，正常使用无需手工碰这些。
 
 #### 查看与日常（-List / -Status）
 
@@ -372,14 +428,14 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 
 #### 服务的增删改（重跑 setup 问答即更新）
 
-**问答流程**：先回显已有通道（编号，首跑无此步）并问「保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）」；已有通道时再问「要修改的已有序号（回车跳过，逗号分隔）」逐项改地址/改本地端口；最后问「可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）」与「新增（多项逗号分隔，如 kafka,zookeeper 或 custom）」，目录项逐项追问远端地址（如「远端 kafka 地址（例如 10.129.12.75:9092，IP:端口）」），`custom` 先问「自定义服务名（限字母数字与 `_-`，如 es7、db2-prod）」再问地址。
+**问答流程**：先回显已有通道（编号，首跑无此步）并问「保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）」；已有通道时再问「要修改的已有序号（回车跳过，逗号分隔）」逐项改地址/改本地端口；最后问「可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）」与「新增（多项逗号分隔，如 kafka,zookeeper 或 custom）」，目录项逐项追问远端地址（如「远端 kafka 地址（例如 10.129.12.75:9092，IP:端口[ 域名]）」，域名可留空、同一次录入，见「透明地址映射」），`custom` 先问「自定义服务名（限字母数字与 `_-`，如 es7、db2-prod）」再问地址。
 
 | 操作 | 怎么做 | 行为 |
 |---|---|---|
 | 新增目录服务 | 新增问答选目录项，给远端 IP:端口 | 端口按远端端口推导/顺延（见下节） |
 | 新增自定义 | `custom` → 服务名（限字母数字与 `_-`）→ IP:端口 | 同上；VM 侧实例名 `cadence-relay@<服务名>` |
 | 删除服务 | 保留问答只列要保留的序号（`a`=全删） | 当场清该服务 Windows portproxy；VM 实例随 setup 回收（所有权核验后 disable，未知 unit 不动；boot 兜底按旧表对账 `--retire`，三参核验一致才回收） |
-| 改远端地址 | 修改问答选序号 → 新地址（回车保留原值）→ 本地端口回车 | relay.json 换地址、端口不变（无冲突时推导值=旧值）；旧端口的 portproxy 与 VM 监听一并清除 |
+| 改远端地址 | 修改问答选序号 → 新地址（回车=地址与域名都保留原值，`-`/`none` 清空域名）→ 本地端口回车 | relay.json 换地址、端口不变（无冲突时推导值=旧值）；旧端口的 portproxy 与 VM 监听一并清除 |
 | 改本地端口 | 修改问答选序号 → 地址回车 → 输入数字 | 校验 1-55535、不撞 stack、不与其他服务重复，vmPort 恒=hostPort+10000 同步；违反当场报错说明 |
 | 多实例同远端端口 | 直接再配一项（如 `mysql` 与 `mysql_log` 同为远端 3306） | 自动顺延：13306/23306、13307/23307 并存 |
 | 参数直给 | `-MySQL`/`-Redis IP:端口` | 清单同名则改地址（端口按现状重分配），没有则新增 |
@@ -396,7 +452,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 要修改的已有序号（回车跳过，逗号分隔）: ⏎
 [cadence-relay] 可新增（目录：mysql redis kafka zookeeper rabbitmq；custom=自定义；回车跳过）
 新增（多项逗号分隔，如 kafka,zookeeper 或 custom）: kafka
-远端 kafka 地址（例如 10.129.12.75:9092，IP:端口）: 10.129.30.8:9092
+远端 kafka 地址（例如 10.129.12.75:9092，IP:端口[ 域名]）: 10.129.30.8:9092
 ```
 
 **改 mysql 地址示例**（换 IP、端口回车不动）：
@@ -404,7 +460,7 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 ```text
 保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）: ⏎
 要修改的已有序号（回车跳过，逗号分隔）: 1
-新远端地址（回车保留 10.129.12.75:3306）: 10.129.20.88:3306
+新远端地址（IP:端口[ 域名]，回车保留 10.129.12.75:3306）: 10.129.20.88:3306
 新本地端口（回车=自动推导；直接输入数字覆盖）: ⏎
 [cadence-relay] 修改 mysql → 10.129.20.88:3306（host 13306 / vm 23306）
 ```

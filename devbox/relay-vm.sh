@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 # cadence relay VM 侧脚本：由 relay.ps1 经 podman machine cp/ssh 以 root 调用，
 # 或由用户在交互 root WSL 窗口直接执行（固化入口，见 devbox/README.md §2.6）。
-# 用法：relay-vm.sh setup [--force] [--retire <旧服务表>] | status | teardown
+# 用法：relay-vm.sh setup [--force] [--retire <旧服务表>] | status | teardown |
+#       dnat-apply | dnat-flush
 # 服务表 /etc/cadence-relay.env：每行 "<name> <vmport> <bindaddr> <hostport>"
 # （relay.ps1 生成，或按 README §2.6 手工写入；服务名与 vmport 不得重复）。
+# 映射表 /etc/cadence-relay-dnat.env（relay.ps1 生成，勿手改）：每行
+#   "<name> <real_ip> <real_port> <target_ip> <target_port> [domain]"
+# dnat-apply 按它把 <real_ip>:<real_port> 用 nft DNAT 改写到 relay 服务表里同名
+# 服务的 <bindaddr>:<vmPort>（socat 的实际监听地址，保证"改写后有人接"）；
+# target_ip/target_port 与当前网关只做三方比对（不一致/漂移只告警，不阻断，
+# 绝不写进规则）。规则先写临时 .nft 文件（纯 LF，nft 拒绝 CRLF）再 nft -f——
+# 命令行拼 'add chain ... { type nat hook ... }' 的空格与分号会被 shell 吃掉。
+# 只动自有表 ip cadence_dnat；dnat-flush 幂等清表。setup 末尾应用（失败只告警，
+# 不回滚已就绪的 relay 通道）；systemd 可用时由 cadence-relay-dnat.service 开机
+# 重放，否则 boot 监督循环每轮重放。
 # 端口被占且未带 --force 时 exit 3；--force 仅接管身份完全一致的前台 socat：
 #   readlink /proc/<pid>/exe 的 basename 必须是 socat，且 NUL 边界 argv 恰为
 #   [socat, TCP-LISTEN:<vmport>,bind=<bindaddr>,fork,reuseaddr, TCP:127.0.0.1:<hostport>]
@@ -38,10 +49,23 @@ LOG_FILE=${RELAY_LOG_FILE:-/var/log/cadence-relay.log}
 WSL_CONF=${RELAY_WSL_CONF:-/etc/wsl.conf}
 UNIT=cadence-relay
 RETIRE_FILE=${RELAY_RETIRE_FILE:-/etc/cadence-relay.retired.env}
+DNAT_ENV_FILE=${RELAY_DNAT_ENV_FILE:-/etc/cadence-relay-dnat.env}
+DNAT_UNIT=${RELAY_DNAT_UNIT:-$UNIT_DIR/cadence-relay-dnat.service}
+DNAT_UNIT_NAME=${DNAT_UNIT##*/}
+
+# 自身绝对路径：unit 的 ExecStart 与 boot 兜底重放都靠它回指本脚本（均带
+# /bin/bash——podman machine cp 不保证可执行位，仓库自身也从不直接 exec 本脚本）
+SELF=${RELAY_VM_SCRIPT:-${BASH_SOURCE[0]:-$0}}
+case "$SELF" in
+  /*) ;;
+  *) SELF=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)/$(basename "$SELF") ;;
+esac
 
 RELAY_LINES=()
 RELAY_NAMES=()
 RELAY_PORTS=()
+DNAT_LINES=()     # 映射表有效行：name real_ip real_port target_ip target_port domain
+DNAT_NAMES=()
 RETIRE_LINES=()   # --retire 旧服务表（boot 兜底回收对账用）
 TAKEOVER_ARGV=()
 UNKNOWN_INFO=()
@@ -55,7 +79,9 @@ SNAP_WSL_EXISTED=0      # 快照时 wsl.conf 是否存在（回滚还原内容�
 SNAP_SUPERV_EXISTED=0   # 快照时自有 boot 监督是否在跑（回滚重启）
 
 log() { printf '[cadence-relay] %s\n' "$*"; }
-die() { printf '[cadence-relay][错误] %s\n' "$*" >&2; exit 1; }
+err() { printf '[cadence-relay][错误] %s\n' "$*" >&2; }
+warn() { printf '[cadence-relay][警告] %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
 die3() { printf '[cadence-relay][冲突] %s\n' "$*" >&2; exit 3; }
 
 read_env() {
@@ -80,6 +106,89 @@ read_env() {
     RELAY_PORTS+=("$vmport")
   done < "$ENV_FILE"
   [ "${#RELAY_LINES[@]}" -gt 0 ] || die "$ENV_FILE 无有效服务行"
+}
+
+is_ipv4() { # 合法 IPv4 点分十进制（四段，各 0..255）
+  local ip=$1 o
+  local -a parts=()
+  case "$ip" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+  IFS=. read -r -a parts <<<"$ip"
+  [ "${#parts[@]}" -eq 4 ] || return 1
+  for o in "${parts[@]}"; do
+    case "$o" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$o" -le 255 ] || return 1
+  done
+  return 0
+}
+
+is_port() { # 1..65535
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+is_domain() { # 映射表第 6 段：合法域名或 '-'；IP 字面量视为配置错误
+  local h=$1
+  [ "$h" = "-" ] && return 0
+  is_ipv4 "$h" && return 1
+  [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+read_dnat_env() { # 映射表：5 或 6 段（4 段视为格式错误——防止误喂服务表）；
+  # 任一条不满足即 die（不静默跳过），target_* 只做比对、不参与规则生成
+  DNAT_LINES=()
+  DNAT_NAMES=()
+  local seen=()
+  [ -f "$DNAT_ENV_FILE" ] \
+    || die "缺映射表 $DNAT_ENV_FILE（由 relay.ps1 生成，勿手改；请重跑 relay.ps1）"
+  local line name real_ip real_port target_ip target_port domain extra key
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    read -r name real_ip real_port target_ip target_port domain extra <<<"$line"
+    case "${name:-}" in '' | '#'* ) continue ;; esac
+    if [ -n "${extra:-}" ]; then
+      die "映射表行段数过多（应为 name real_ip real_port target_ip target_port [domain]）：$line"
+    fi
+    if [ -z "${target_port:-}" ]; then
+      die "映射表行段数不足（应为 5 或 6 段；4 段多半是把 relay 服务表喂进来了）：$line"
+    fi
+    case "$name" in
+      *[!A-Za-z0-9_-]*) die "映射表服务名限字母数字与 _-（与 relay 服务名同一规则）：$name" ;;
+    esac
+    case " ${DNAT_NAMES[*]:-} " in *" $name "*) die "映射表服务名重复：$name（每服务一行）" ;; esac
+    is_ipv4 "$real_ip" || die "映射表 real_ip 不是合法 IPv4：$name $real_ip"
+    is_ipv4 "$target_ip" || die "映射表 target_ip 不是合法 IPv4：$name $target_ip"
+    is_port "$real_port" || die "映射表 real_port 不是合法端口（应 1..65535）：$name $real_port"
+    is_port "$target_port" || die "映射表 target_port 不是合法端口（应 1..65535）：$name $target_port"
+    key="$real_ip:$real_port"
+    case " ${seen[*]:-} " in
+      *" $key "*) die "映射表 (real_ip, real_port) 必须唯一：$key（$name）" ;;
+    esac
+    if [ -n "${domain:-}" ]; then
+      is_ipv4 "$domain" \
+        && die "映射表域名段不得写 IP 字面量：$name $domain（改用 real_ip/target_ip 段，或写 -）"
+      is_domain "$domain" \
+        || die "映射表域名段非法：$name $domain（只允许字母数字与 .-，或写 -）"
+    else
+      domain=-
+    fi
+    seen+=("$key")
+    DNAT_LINES+=("$name $real_ip $real_port $target_ip $target_port $domain")
+    DNAT_NAMES+=("$name")
+  done < "$DNAT_ENV_FILE"
+  [ "${#DNAT_LINES[@]}" -gt 0 ] \
+    || die "$DNAT_ENV_FILE 无有效映射行（# 注释与空行之外至少一条；请重跑 relay.ps1）"
+}
+
+svc_target() { # $1=服务名 → 打印 "<bindaddr> <vmPort>"；服务表无该名返回 1
+  local line n vmport bindaddr hostport
+  for line in ${RELAY_LINES[@]+"${RELAY_LINES[@]}"}; do
+    read -r n vmport bindaddr hostport <<<"$line"
+    if [ "$n" = "$1" ]; then
+      printf '%s %s' "$bindaddr" "$vmport"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # 监听某端口的 pid 列表（可能为空）
@@ -160,15 +269,41 @@ WantedBy=multi-user.target
 EOF
 }
 
+write_dnat_unit() { # DNAT 开机重放单元（oneshot）：ExecStart/ExecStop 均带 /bin/bash
+  # ——podman machine cp 不保证可执行位；RemainAfterExit 让 stop 走 ExecStop=flush
+  cat > "$DNAT_UNIT" <<EOF
+[Unit]
+Description=cadence relay DNAT rules (idempotent apply from $DNAT_ENV_FILE)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $SELF dnat-apply
+ExecStop=/bin/bash $SELF dnat-flush
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 write_boot_script() {
   cat > "$BOOT_SCRIPT" <<HEADER
 #!/bin/sh
 # cadence relay boot 兜底监督（relay-vm.sh 生成）：systemd 不可用时代替
-# Restart=always——每 5 秒巡检服务表，监听消失即重拉（网桥晚就绪自恢复）。
+# Restart=always——每轮先幂等重放 DNAT 规则（nft 表在内核态、重启即丢；
+# 未配置映射表时本步快速失败，不新增第二条 [boot] command），再每 5 秒
+# 巡检服务表，监听消失即重拉（网桥晚就绪自恢复）。
 ENV_FILE='$ENV_FILE'
 RUN_SCRIPT='$RUN_SCRIPT'
 LOG_FILE='$LOG_FILE'
+DNAT_ENV_FILE='$DNAT_ENV_FILE'
 while :; do
+  RELAY_ENV_FILE="\$ENV_FILE" RELAY_DNAT_ENV_FILE="\$DNAT_ENV_FILE" \\
+    /bin/bash '$SELF' dnat-apply >/dev/null 2>&1 || true
   while read -r name vmport rest; do
     case "\$name" in ''|'#'*) continue ;; esac
     if ! ss -tln 2>/dev/null | awk -v p=":\$vmport\$" '\$4 ~ p' | grep -q .; then
@@ -342,6 +477,138 @@ retire_stale_listeners() { # 旧服务表对账：旧端口上身份一致的自
   done
 }
 
+dnat_apply() { # 在子 shell 内执行：die 只终止本次应用并返回非 0，
+  # setup 调用时不会连带杀死已就绪的 relay（附加能力失败只告警）
+  ( _dnat_apply )
+}
+
+_dnat_apply() {
+  read_dnat_env
+  command -v nft >/dev/null 2>&1 \
+    || die "缺少 nft（VM 内用 nft 做 DNAT；仅 iptables 的环境不支持本方案）"
+  read_env
+  local line name real_ip real_port target_ip target_port domain
+  local bindaddr vmport target cur gw='' gw_shown=0
+  local -a addrs=() rules=()
+  local matched=0 tmp r
+  if command -v ip >/dev/null 2>&1; then
+    while IFS= read -r cur; do addrs+=("$cur"); done \
+      < <(ip -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  fi
+  # 当前网桥 gateway 仅作诊断增强（VM 内通常没有 podman CLI，读不到就跳过）
+  if command -v podman >/dev/null 2>&1; then
+    gw=$(podman network inspect cadence_default \
+      --format '{{range .Subnets}}{{.Gateway}}{{end}}' 2>/dev/null) || gw=
+  fi
+  for line in "${DNAT_LINES[@]}"; do
+    read -r name real_ip real_port target_ip target_port domain <<<"$line"
+    if ! target=$(svc_target "$name"); then
+      err "$name: 服务表 $ENV_FILE 缺该服务，跳过（重跑 relay.ps1）"
+      continue
+    fi
+    read -r bindaddr vmport <<<"$target"
+    matched=$((matched + 1))
+    if [ "$target_ip" != "$bindaddr" ] || [ "$target_port" != "$vmport" ]; then
+      warn "$name: 映射表与 relay 服务表不一致（映射表 target=$target_ip:$target_port，服务表 bind=$bindaddr:$vmport）——按服务表写规则；重跑 relay.ps1"
+    fi
+    if [ "${#addrs[@]}" -gt 0 ] && ! printf '%s\n' "${addrs[@]}" | grep -qx "$bindaddr"; then
+      warn "$name: bind $bindaddr 不在本机网卡上——网桥已重建/网关漂移；仍按服务表 bindaddr 写规则，重跑 relay.ps1"
+    fi
+    if [ -n "$gw" ] && [ "$gw" != "$bindaddr" ] && [ "$gw_shown" -eq 0 ]; then
+      warn "诊断：podman 当前网桥 gateway=$gw 与 bindaddr=$bindaddr 不同（仅诊断，不影响规则）"
+      gw_shown=1
+    fi
+    rules+=("ip daddr $real_ip tcp dport $real_port dnat to $bindaddr:$vmport")
+  done
+  if [ "$matched" -eq 0 ]; then
+    err "映射表中的服务名全部不在 $ENV_FILE，未生成任何 DNAT 规则（重跑 relay.ps1）"
+    exit 1
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cadence-dnat.XXXXXX") || die "mktemp 失败（无法写 nft 规则文件）"
+  {
+    printf '%s\n' 'table ip cadence_dnat {'
+    printf '%s\n' '  chain prerouting {'
+    printf '%s\n' '    type nat hook prerouting priority -101; policy accept;'
+    for r in "${rules[@]}"; do
+      printf '    %s\n' "$r"
+    done
+    printf '%s\n' '  }'
+    printf '%s\n' '}'
+  } >"$tmp" || { rm -f "$tmp"; die "写 nft 规则文件失败：$tmp"; }
+  nft delete table ip cadence_dnat 2>/dev/null || true
+  if ! nft -f "$tmp"; then
+    rm -f "$tmp"
+    die "nft -f 应用失败（table ip cadence_dnat 未建立；临时规则文件已删除）"
+  fi
+  rm -f "$tmp"
+  log "DNAT：已应用 ${#rules[@]} 条规则（table ip cadence_dnat，目标取服务表 bindaddr/vmport）"
+}
+
+dnat_flush() { # 只删自有表，幂等；nft 不可用时 no-op
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table ip cadence_dnat 2>/dev/null || true
+  fi
+  log "DNAT：已清除 table ip cadence_dnat（若存在）"
+}
+
+dnat_status() { # 只读诊断：规则存在性 + 映射表/服务表一致性 + 漂移；有问题返回 1
+  if [ ! -f "$DNAT_ENV_FILE" ]; then
+    log "DNAT: 缺映射表 $DNAT_ENV_FILE——DNAT 直连未配置（重跑 relay.ps1 生成）"
+    return 1
+  fi
+  read_dnat_env
+  local line name real_ip real_port target_ip target_port domain
+  local bindaddr vmport target cur gw='' table='' fail=0
+  local -a addrs=()
+  if command -v ip >/dev/null 2>&1; then
+    while IFS= read -r cur; do addrs+=("$cur"); done \
+      < <(ip -o addr 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    gw=$(podman network inspect cadence_default \
+      --format '{{range .Subnets}}{{.Gateway}}{{end}}' 2>/dev/null) || gw=
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    table=$(nft list table ip cadence_dnat 2>/dev/null) || table=
+    if [ -z "$table" ]; then
+      log "DNAT: table ip cadence_dnat 不存在——规则缺失（VM 重启后未重放？重跑 dnat-apply 或 relay.ps1）"
+      fail=1
+    fi
+  else
+    log "DNAT: 无 nft 命令，无法检查规则（本环境不支持 DNAT）"
+    fail=1
+  fi
+  for line in "${DNAT_LINES[@]}"; do
+    read -r name real_ip real_port target_ip target_port domain <<<"$line"
+    if ! target=$(svc_target "$name"); then
+      log "DNAT: $name $real_ip:$real_port 无法映射——服务表 $ENV_FILE 缺该服务（重跑 relay.ps1）"
+      fail=1
+      continue
+    fi
+    read -r bindaddr vmport <<<"$target"
+    if [ "$target_ip" != "$bindaddr" ] || [ "$target_port" != "$vmport" ]; then
+      log "DNAT: $name 映射表 target=$target_ip:$target_port / 服务表 bind=$bindaddr:$vmport 不一致（告警，规则按服务表）——重跑 relay.ps1"
+    fi
+    if [ "${#addrs[@]}" -gt 0 ] && ! printf '%s\n' "${addrs[@]}" | grep -qx "$bindaddr"; then
+      log "DNAT: $name bind $bindaddr 不在本机网卡上——网桥已重建/网关漂移，重跑 relay.ps1"
+      fail=1
+    fi
+    if [ -n "$gw" ] && [ "$gw" != "$bindaddr" ]; then
+      log "DNAT: 诊断 当前网桥 gateway=$gw 与 bindaddr=$bindaddr 不同（仅诊断）"
+    fi
+    if [ -n "$table" ]; then
+      if printf '%s\n' "$table" \
+        | grep -qF "ip daddr $real_ip tcp dport $real_port dnat to $bindaddr:$vmport"; then
+        log "DNAT: $name $real_ip:$real_port → $bindaddr:$vmport OK"
+      else
+        log "DNAT: $name $real_ip:$real_port → $bindaddr:$vmport 规则缺失（重跑 dnat-apply）"
+        fail=1
+      fi
+    fi
+  done
+  return "$fail"
+}
+
 cmd_setup() {
   local force=0 retire_env=
   while [ $# -gt 0 ]; do
@@ -435,7 +702,7 @@ cmd_setup() {
   SNAP_FILES=() SNAP_ENABLED=() SNAP_ACTIVE=() NEW_ENABLED=()
   SNAP_WSL_EXISTED=0 SNAP_SUPERV_EXISTED=0
   local sf nm
-  for sf in "$RUN_SCRIPT" "$UNIT_TEMPLATE" "$BOOT_SCRIPT" "$OLD_UNIT"; do
+  for sf in "$RUN_SCRIPT" "$UNIT_TEMPLATE" "$BOOT_SCRIPT" "$OLD_UNIT" "$DNAT_UNIT"; do
     if [ -f "$sf" ]; then
       cp -p "$sf" "$SNAP_DIR/snap-$(basename "$sf")" || { rm -rf "$SNAP_DIR"; die "快照备份失败：$sf"; }
       SNAP_FILES+=("$sf")
@@ -455,6 +722,8 @@ cmd_setup() {
       systemctl is-enabled "$UNIT@$nm" >/dev/null 2>&1 && SNAP_ENABLED+=("$UNIT@$nm")
       systemctl is-active "$UNIT@$nm" >/dev/null 2>&1 && SNAP_ACTIVE+=("$UNIT@$nm")
     done
+    systemctl is-enabled "$DNAT_UNIT_NAME" >/dev/null 2>&1 && SNAP_ENABLED+=("$DNAT_UNIT_NAME")
+    systemctl is-active "$DNAT_UNIT_NAME" >/dev/null 2>&1 && SNAP_ACTIVE+=("$DNAT_UNIT_NAME")
   fi
 
 
@@ -476,6 +745,8 @@ cmd_setup() {
     fi
     [ -e "$UNIT_TEMPLATE" ] || NEW_FILES+=("$UNIT_TEMPLATE")
     write_unit_template
+    [ -e "$DNAT_UNIT" ] || NEW_FILES+=("$DNAT_UNIT")
+    write_dnat_unit
     systemctl daemon-reload >/dev/null 2>&1 \
       || { rollback_setup 1; die "daemon-reload 失败"; }
   else
@@ -543,6 +814,16 @@ cmd_setup() {
     rollback_setup "$use_systemd"
     exit 1
   fi
+  # ── DNAT 附加能力：不参与 relay 事务——失败只告警，不回滚已就绪的通道 ──
+  if [ "$use_systemd" -eq 1 ]; then
+    case " ${SNAP_ENABLED[*]:-} " in
+      *" $DNAT_UNIT_NAME "*) ;; # 快照时已 enabled：回滚侧负责恢复，不入 NEW_ENABLED
+      *) NEW_ENABLED+=("$DNAT_UNIT_NAME") ;;
+    esac
+    systemctl enable --now "$DNAT_UNIT_NAME" >/dev/null 2>&1 \
+      || log "警告：enable --now $DNAT_UNIT_NAME 失败（DNAT 直连暂不可用，status 会暴露）"
+  fi
+  dnat_apply || log "警告：DNAT 规则未生效（relay 通道已就绪；见上方错误，重跑 relay.ps1 或 relay-vm.sh dnat-apply）"
   rm -rf "$SNAP_DIR" 2>/dev/null || true
   if [ "$use_systemd" -eq 1 ]; then
     log "持久化：每服务 systemd 单元 $UNIT@<name>（Restart=always，开机自启）"
@@ -594,15 +875,20 @@ cmd_status() {
       fail=1
     fi
   done
+  dnat_status || fail=1
   exit "$fail"
 }
 
 cmd_teardown() {
-  # 只管理自有痕迹：boot 监督、cadence-relay@ 实例与模板、run/boot 脚本、服务表、
-  # 日志、wsl.conf 钩子行、旧版单 unit。不 pkill -f、不卸载 socat 包、不动未知
-  # 监听与无关 unit、不动 Windows 侧 portproxy（如需删除请在 Windows 侧处理）。
+  # 只管理自有痕迹：boot 监督、cadence-relay@ 实例与模板、dnat 单元与映射表、
+  # run/boot 脚本、服务表、日志、wsl.conf 钩子行、旧版单 unit、自有 nft 表。
+  # 不 pkill -f、不卸载 socat 包、不动未知监听与无关 unit、不动 Windows 侧
+  # portproxy（如需删除请在 Windows 侧处理）。
   local line name vmport bindaddr hostport p link inst
   kill_relay_supervisor
+  # 先停 DNAT 单元再清规则：否则下一次开机被 unit 重放回来（对称拆除）
+  systemctl disable --now "$DNAT_UNIT_NAME" >/dev/null 2>&1 || true
+  dnat_flush
   if [ -f "$ENV_FILE" ]; then
     while read -r name vmport bindaddr hostport; do
       case "$name" in '' | '#'* ) continue ;; esac
@@ -630,10 +916,10 @@ cmd_teardown() {
   fi
   # 旧版单 unit 兼容清理
   systemctl disable --now "$UNIT" >/dev/null 2>&1 || true
-  rm -f "$UNIT_TEMPLATE" "$OLD_UNIT" "$OLD_WANTS" "$RUN_SCRIPT" "$BOOT_SCRIPT" "$ENV_FILE" "$RETIRE_FILE" "$LOG_FILE"
+  rm -f "$UNIT_TEMPLATE" "$OLD_UNIT" "$OLD_WANTS" "$RUN_SCRIPT" "$BOOT_SCRIPT" "$ENV_FILE" "$RETIRE_FILE" "$LOG_FILE" "$DNAT_UNIT" "$DNAT_ENV_FILE"
   unhook_wslconf
   systemctl daemon-reload >/dev/null 2>&1 || true
-  log "teardown 完成：监督/systemd 单元（模板+实例+旧版）/boot 钩子/run 脚本/服务表/日志已清除"
+  log "teardown 完成：监督/systemd 单元（模板+实例+旧版+dnat）/boot 钩子/run 脚本/两张 env 表/日志/nft 自有表已清除"
   log "未动：socat 包、未知监听、Windows 侧 portproxy（如需删除请在 Windows 侧处理）"
 }
 
@@ -641,8 +927,10 @@ case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   status) cmd_status ;;
   teardown) cmd_teardown ;;
+  dnat-apply) dnat_apply || exit 1 ;;
+  dnat-flush) dnat_flush ;;
   *)
-    printf '用法：relay-vm.sh setup [--force] [--retire <旧服务表>] | status | teardown\n' >&2
+    printf '用法：relay-vm.sh setup [--force] [--retire <旧服务表>] | status | teardown | dnat-apply | dnat-flush\n' >&2
     exit 64
     ;;
 esac

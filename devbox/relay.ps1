@@ -166,22 +166,68 @@ function Test-AddrFormat($s) { return ($s -match '^(\d{1,3}\.){3}\d{1,3}:\d{2,5}
 
 function Test-SvcName($s) { return ($s -match '^[A-Za-z0-9_-]+$') }
 
+# 合法 IPv4 点分十进制（每段 0-255）：映射表 real_ip/target_ip 的生成端校验
+function Test-IPv4($s) {
+  if (-not $s) { return $false }
+  if ("$s" -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { return $false }
+  foreach ($o in ("$s" -split '\.')) { if ([int]$o -gt 255) { return $false } }
+  return $true
+}
+
+# 合法域名（RFC 952/1123）：拒绝空串、含空白、首尾为 . 或 -、连续点、单标签 >63、
+# 总长 >253、IP 字面量（域名位写 IP 是配置错误，应填地址段）；`-` 为清空语义、
+# 不是域名。大小写归一化由调用方落盘前完成（Split-AddrInput 已 ToLowerInvariant）
+function Test-HostName($s) {
+  if ($null -eq $s) { return $false }
+  $s = "$s".Trim()
+  if (-not $s) { return $false }
+  if ($s.Length -gt 253) { return $false }
+  if ($s -match '^(\d{1,3}\.){3}\d{1,3}$') { return $false }
+  if ($s -notmatch '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$') { return $false }
+  if ($s -match '\.\.') { return $false }
+  foreach ($lab in ($s -split '\.')) { if ($lab.Length -gt 63) { return $false } }
+  return $true
+}
+
+# 地址问句的唯一输入形态："IP:端口" 或 "IP:端口 域名"（域名可选，同一问句，不二次询问）
+# 地址段走 Test-AddrFormat、域名段走 Test-HostName；域名段留空=沿用 $oldHost，
+# 输入 "-" / none = 显式清空（否则"回车保持原值"会让已录域名永远删不掉）
+function Split-AddrInput($raw, $oldHost) {
+  $raw = "$raw".Trim()
+  $tok = @($raw -split '\s+', 2 | Where-Object { $_ -ne '' })
+  $addr = if ($tok.Count -ge 1) { $tok[0] } else { '' }
+  if (-not (Test-AddrFormat $addr)) { Die "地址格式应为 IP:端口[ 域名]，收到：$raw" }
+  # 局部变量名不叫 $host：$Host 是 PowerShell 内置只读自动变量（大小写不敏感），
+  # 给它赋值会抛 "Cannot overwrite variable host because it is read-only"。
+  # 对象的属性名仍是 host（relay.json 的键名），不受影响。
+  $domain = $oldHost
+  if ($tok.Count -gt 1) {
+    $h = $tok[1].Trim()
+    if ($h -in @('-', 'none')) { $domain = '' }
+    elseif (-not (Test-HostName $h)) { Die "域名格式不合法：$h（留空=保持原值；- 或 none=清空）" }
+    else { $domain = $h.ToLowerInvariant() }
+  }
+  return @{ addr = $addr; host = $domain }
+}
+
 # 解析 IP:端口 → 服务对象（含推导端口，占用表感知自动顺延）；格式/越界在此显式报错
-function New-Service($name, $val, $taken) {
-  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
+# $domain 为可选域名（与地址同一次交互录入）；空=$null 时归一化为空串，落盘时省略该键。
+# 形参不叫 $host：$Host 是内置只读自动变量（大小写不敏感），同名形参会直接报错。
+function New-Service($name, $val, $taken, $domain = '') {
+  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口[ 域名]，收到：$val" }
   $hp = $val -split ':'
   $ports = Get-RelayPorts ([int]$hp[1]) $taken
   $taken[$ports.hostPort] = $name
   $taken[$ports.vmPort] = $name
   return [pscustomobject]@{
     name = $name; remoteHost = $hp[0]; remotePort = [int]$hp[1]
-    hostPort = $ports.hostPort; vmPort = $ports.vmPort
+    hostPort = $ports.hostPort; vmPort = $ports.vmPort; host = "$domain"
   }
 }
 
 # 显式指定本地端口（交互修改用）：校验范围/撞栈/撞已分配；vmPort 恒为 hostPort+10000
-function New-ServiceWithHostPort($name, $val, $hostPort, $taken) {
-  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口，收到：$val" }
+function New-ServiceWithHostPort($name, $val, $hostPort, $taken, $domain = '') {
+  if (-not (Test-AddrFormat $val)) { Die "$name 地址格式应为 IP:端口[ 域名]，收到：$val" }
   $hp = $val -split ':'
   $rp = [int]$hp[1]
   if ($rp -lt 1 -or $rp -gt 45535) { Die "$name 远端端口超出可推导范围（1-45535）：$rp" }
@@ -196,7 +242,7 @@ function New-ServiceWithHostPort($name, $val, $hostPort, $taken) {
   $taken[$vmPort] = $name
   return [pscustomobject]@{
     name = $name; remoteHost = $hp[0]; remotePort = $rp
-    hostPort = $hostPort; vmPort = $vmPort
+    hostPort = $hostPort; vmPort = $vmPort; host = "$domain"
   }
 }
 
@@ -212,10 +258,14 @@ function Collect-Services($cfg) {
   if ($cfg) {
     # JSON 数值 pwsh7 下解析为 Int64、WinPS 为 Int32：统一转 [int]，保证占用表键与
     # 推导/校验的 Int32 探针同型（否则 ContainsKey/-contains 会误判为不冲突）
+    # host 可选：旧 relay.json 无该键等价于"未录入"（不假定键存在，但已录域名不得丢）
     $old = @($cfg.services | ForEach-Object {
+      $h = ''
+      if ($_.PSObject.Properties['host']) { $h = [string]$_.host }
       [pscustomobject]@{
         name = $_.name; remoteHost = $_.remoteHost
         remotePort = [int]$_.remotePort; hostPort = [int]$_.hostPort; vmPort = [int]$_.vmPort
+        host = $h
       }
     })
   }
@@ -225,7 +275,9 @@ function Collect-Services($cfg) {
     Info '已有通道（编号）：'
     for ($i = 0; $i -lt $old.Count; $i++) {
       $o = $old[$i]
-      $line = '  {0}. {1} → {2}:{3}（host {4} / vm {5}）' -f ($i + 1), $o.name, $o.remoteHost, $o.remotePort, $o.hostPort, $o.vmPort
+      $dn = ''
+      if ($o.host) { $dn = "，域名 $($o.host)" }
+      $line = '  {0}. {1} → {2}:{3}（host {4} / vm {5}{6}）' -f ($i + 1), $o.name, $o.remoteHost, $o.remotePort, $o.hostPort, $o.vmPort, $dn
       Write-Host $line
     }
     $ans = (Read-Host '保留已有序号（回车=全部保留，a=全部删除，逗号分隔=仅保留所列）').Trim()
@@ -293,19 +345,30 @@ function Collect-Services($cfg) {
   }
 
   # 阶段二：修改项按原序重分配（地址回车=保留原值；端口回车=自动顺延推导，数字=显式覆盖）
+  # 地址问句同一行可续写域名（IP:端口[ 域名]）：回车=地址与域名都保持原值，
+  # "-" / none=清空域名——没有第二次询问，也不要求用户手改 relay.json
   foreach ($k in $editIdx) {
     $o = $old[$k]
-    $val = (Read-Host "新远端地址（回车保留 $($o.remoteHost):$($o.remotePort)）").Trim()
-    if (-not $val) { $val = "$($o.remoteHost):$($o.remotePort)" }
+    $keep = "$($o.remoteHost):$($o.remotePort)"
+    if ($o.host) { $keep = "$keep $($o.host)" }
+    $val = (Read-Host "新远端地址（IP:端口[ 域名]，回车保留 $keep）").Trim()
+    if (-not $val) {
+      $sp = @{ addr = "$($o.remoteHost):$($o.remotePort)"; host = $o.host }
+    } else {
+      $sp = Split-AddrInput $val $o.host
+    }
+    $val = $sp.addr
+    $dn = ''
+    if ($sp.host) { $dn = "，域名 $($sp.host)" }
     $np = (Read-Host '新本地端口（回车=自动推导；直接输入数字覆盖）').Trim()
     if ($np -eq '') {
-      $obj = New-Service $o.name $val $taken
-      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)）"
+      $obj = New-Service $o.name $val $taken $sp.host
+      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)$dn）"
     } else {
       $pnum = 0
       if (-not [int]::TryParse($np, [ref]$pnum)) { Die "$($o.name) 本地端口须为数字：$np" }
-      $obj = New-ServiceWithHostPort $o.name $val $pnum $taken
-      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)，显式指定）"
+      $obj = New-ServiceWithHostPort $o.name $val $pnum $taken $sp.host
+      Info "修改 $($o.name) → $val（host $($obj.hostPort) / vm $($obj.vmPort)，显式指定$dn）"
     }
     $kept[$k] = $obj
     $names[$o.name] = $true
@@ -320,7 +383,10 @@ function Collect-Services($cfg) {
   foreach ($pn in @('mysql', 'redis')) {
     $val = @{ mysql = $MySQL; redis = $Redis }[$pn]
     if (-not $val) { continue }
-    $obj = New-Service $pn $val $taken
+    # 参数保持纯 IP:端口形态（不解析域名），但覆盖同名服务时旧域名不能丢
+    $oldHost = ''
+    foreach ($o in $old) { if ($o.name -eq $pn) { $oldHost = $o.host } }
+    $obj = New-Service $pn $val $taken $oldHost
     $verb = '参数新增'
     if ($keptNameList -contains $pn) { $verb = '参数更新' }
     if ($names.ContainsKey($pn)) {
@@ -333,7 +399,9 @@ function Collect-Services($cfg) {
     }
     $note = ''
     if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
-    Info "$verb $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
+    $dn = ''
+    if ($obj.host) { $dn = "，域名 $($obj.host)" }
+    Info "$verb $pn → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note$dn）"
   }
 
   $catNames = @($ServiceCatalog.Keys)
@@ -347,24 +415,30 @@ function Collect-Services($cfg) {
       if (-not $newName) { Warn '未输入服务名，跳过自定义项'; continue }
       if (-not (Test-SvcName $newName)) { Die "服务名限字母数字与 _-：$newName" }
       if ($names.ContainsKey($newName)) { Warn "$newName 已在清单中，跳过"; continue }
-      $val = (Read-Host "远端 $newName 地址（IP:端口，域名暂不支持）").Trim()
+      $val = (Read-Host "远端 $newName 地址（IP:端口[ 域名]，域名可留空）").Trim()
       if (-not $val) { Warn "跳过 $newName（未提供地址）"; continue }
+      $sp = Split-AddrInput $val ''
       $names[$newName] = $true
-      $obj = New-Service $newName $val $taken
+      $obj = New-Service $newName $sp.addr $taken $sp.host
       $note = ''
       if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
-      Info "新增 $newName → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
+      $dn = ''
+      if ($sp.host) { $dn = "，域名 $($sp.host)" }
+      Info "新增 $newName → $($sp.addr)（host $($obj.hostPort) / vm $($obj.vmPort)$note$dn）"
       $result += $obj
     } else {
       if ($catNames -notcontains $t) { Die "未知目录项：$t（目录：$($catNames -join ' ') 或 custom）" }
       if ($names.ContainsKey($t)) { Warn "$t 已在清单中，跳过（改地址：不保留该项后新增）"; continue }
-      $val = (Read-Host "远端 $t 地址（例如 10.129.12.75:$($ServiceCatalog[$t])，IP:端口）").Trim()
+      $val = (Read-Host "远端 $t 地址（例如 10.129.12.75:$($ServiceCatalog[$t])，IP:端口[ 域名]）").Trim()
       if (-not $val) { Warn "跳过 $t（未提供地址）"; continue }
+      $sp = Split-AddrInput $val ''
       $names[$t] = $true
-      $obj = New-Service $t $val $taken
+      $obj = New-Service $t $sp.addr $taken $sp.host
       $note = ''
       if ($obj.hostPort - $obj.remotePort -ne 10000) { $note = '，自动顺延' }
-      Info "新增 $t → $val（host $($obj.hostPort) / vm $($obj.vmPort)$note）"
+      $dn = ''
+      if ($sp.host) { $dn = "，域名 $($sp.host)" }
+      Info "新增 $t → $($sp.addr)（host $($obj.hostPort) / vm $($obj.vmPort)$note$dn）"
       $result += $obj
     }
   }
@@ -411,6 +485,57 @@ function Undo-Portproxy($ports) { # 失败路径回滚已建 portproxy，避免�
   }
 }
 
+# ---- DNAT 映射表（设计 §5.3/§5.4）----
+# 格式：5 段必填 + 可选第 6 段域名（缺省写 '-'）；'#' 注释行、CRLF 容忍。
+#   <name> <real_ip> <real_port> <target_ip> <target_port> [domain]
+# target_ip 写本次生成时的网桥网关（审计/漂移比对）；DNAT 规则的实际目标由 VM 侧
+# 取 relay 服务表的 bindaddr 与 vmPort，本表只作比对与诊断，不参与规则生成。
+# 生成端校验：name 合法、IP 合法、端口 1..65535、(real_ip, real_port) 唯一、
+# 域名段合法或 '-'。任一不满足即 Die（不静默跳过、不产出半套映射）。
+function New-DnatMapText($services, $gw) {
+  if (-not (Test-IPv4 $gw)) { Die "网桥网关非法：$gw（无法生成映射表的 target_ip）" }
+  $lines = @(
+    '# generated by relay.ps1 - do not edit'
+    '# <name> <real_ip> <real_port> <target_ip> <target_port> [domain]'
+  )
+  $seen = @{}
+  foreach ($s in $services) {
+    if (-not (Test-SvcName $s.name)) { Die "映射表服务名非法：$($s.name)（限字母数字与 _-）" }
+    if (-not (Test-IPv4 $s.remoteHost)) { Die "映射表 $($s.name) 的真实 IP 非法：$($s.remoteHost)" }
+    $rp = [int]$s.remotePort
+    $tp = [int]$s.vmPort
+    if ($rp -lt 1 -or $rp -gt 65535) { Die "映射表 $($s.name) 的 real_port 超出 1-65535：$rp" }
+    if ($tp -lt 1 -or $tp -gt 65535) { Die "映射表 $($s.name) 的 target_port 超出 1-65535：$tp" }
+    $key = "$($s.remoteHost):$rp"
+    if ($seen.ContainsKey($key)) { Die "映射表 (real_ip, real_port) 重复：$key 同时属于 $($seen[$key]) 与 $($s.name)" }
+    $seen[$key] = $s.name
+    $dom = '-'
+    $h = ''
+    if ($s.PSObject.Properties['host']) { $h = "$($s.host)".Trim() }
+    if ($h -and $h -ne '-') {
+      if (-not (Test-HostName $h)) { Die "映射表 $($s.name) 的域名非法：$h" }
+      $dom = $h.ToLowerInvariant()
+    }
+    $lines += '{0} {1} {2} {3} {4} {5}' -f $s.name, $s.remoteHost, $rp, $gw, $tp, $dom
+  }
+  return (($lines -join "`n") + "`n")
+}
+
+# 原子落盘：先写 .tmp 再 Move-Item -Force（避免半截文件被消费）；-Encoding ascii
+# 保证无 BOM（WinPS 5.1 的 utf8 会写 BOM，首行 name 变成 \ufeffmysql 会让 bash 侧失败），
+# 手工拼 "`n" + -NoNewline 保证纯 LF（CRLF 会被 nft/bash 拒绝）
+function Write-DnatMapFile($text, $path) {
+  New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
+  $tmp = "$path.tmp"
+  try {
+    Set-Content -Encoding ascii -NoNewline -Path $tmp -Value $text
+    Move-Item -Force $tmp $path
+  } catch {
+    Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
 # ---- 通道搭建 ----
 function Invoke-Setup {
   $cfg = Load-Config
@@ -443,6 +568,10 @@ function Invoke-Setup {
 
   $gw = Get-BridgeGateway
   Info "podman 网桥网关：$gw（连接地址将形如 ${gw}:23306，稳定不随 DHCP 变化）"
+  # DNAT 映射表内容：由内存中的 $services + $gw 渲染，并在此完成生成端校验（§5.3）。
+  # 此时 relay.json 尚未落盘（它到成功后才写），所以数据源只能是本次问答结果。
+  # 校验失败即终止：Windows portproxy 与 VM 侧都还没有本轮的改动产物。
+  $mapText = New-DnatMapText $services $gw
   $ctr = Get-DevboxContainer
 
   # Windows 侧 portproxy：幂等（先删同监听端口旧规则再建，仅 127.0.0.1，不暴露局域网）
@@ -467,15 +596,24 @@ function Invoke-Setup {
   $retLines = @('# name vmport bindaddr hostport')
   foreach ($o in $stale) { $retLines += "$($o.name) $($o.vmPort) $gw $($o.hostPort)" }
   ($retLines -join "`n") + "`n" | Set-Content -Encoding ascii -NoNewline $retireFile
+  # DNAT 映射表：同一内容两份——安装目录 stack/data/（容器内只读诊断，已被 .gitignore）
+  # 与 VM /etc/cadence-relay-dnat.env（dnat_apply 的输入）。无 BOM、纯 LF、原子替换。
+  $mapFile = Join-Path (Join-Path $InstallDir 'stack') 'data\relay-map.env'
+  try { Write-DnatMapFile $mapText $mapFile }
+  catch { Undo-Portproxy $created; Die "映射表落盘失败（$mapFile）：$($_.Exception.Message)" }
+  Info "映射表：$mapFile（$($services.Count) 条）"
   podman machine cp "$PSScriptRoot\relay-vm.sh" "${mach}:/tmp/cadence-relay-vm.sh"
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay-vm.sh 失败' }
   podman machine cp "$envFile" "${mach}:/tmp/cadence-relay.env"
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay.env 失败' }
   podman machine cp "$retireFile" "${mach}:/tmp/cadence-relay.retired.env"
   if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp retire.env 失败' }
+  podman machine cp "$mapFile" "${mach}:/tmp/cadence-relay-dnat.env"
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die 'machine cp relay-map.env 失败' }
   $mvCmd = 'sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh'
   $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay.env /etc/cadence-relay.env"
   $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay.retired.env /etc/cadence-relay.retired.env"
+  $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay-dnat.env /etc/cadence-relay-dnat.env"
   $null = podman machine ssh $mvCmd
 
   $setupCmd = 'sudo bash /usr/local/bin/relay-vm.sh setup --retire /etc/cadence-relay.retired.env'
@@ -496,7 +634,16 @@ function Invoke-Setup {
   }
 
   # 留痕（成功才落盘，teardown 按此精确回滚）
-  $cfgOut = @{ version = 1; gateway = $gw; services = $services }
+  # host 仅在非空时写入：旧 relay.json 无该键等价于"未录入"，读取侧按属性是否存在判空
+  $svcOut = foreach ($s in $services) {
+    $o = [ordered]@{
+      name = $s.name; remoteHost = $s.remoteHost; remotePort = $s.remotePort
+      hostPort = $s.hostPort; vmPort = $s.vmPort
+    }
+    if ($s.host) { $o['host'] = $s.host }
+    [pscustomobject]$o
+  }
+  $cfgOut = @{ version = 1; gateway = $gw; services = @($svcOut) }
   $cfgOut | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii $RelayJson
 
   # 存量安装目录的 .gitignore 可能早于 relay 存在：补一行防误提交内网 IP 配置
@@ -518,6 +665,8 @@ function Invoke-List {
   $gw = $cfg.gateway
   if (-not $gw) { $gw = Get-BridgeGateway }
   Info '已配置通道（relay.json 留痕；探活请用 -Status）：'
+  # 不新增域名列：域名不参与容器连接（DNAT 只按 IP 匹配），且本表列宽受
+  # "每行 ≤100 字符"约束（tests/devbox/test_relay.py 钉住），域名列最容易踩线
   $fmt = '  {0,-4} {1,-14} {2,-22} {3,-21} {4}'
   Write-Host ($fmt -f '序号', '服务名', '远端地址', 'Windows portproxy', '容器连接地址')
   $i = 0

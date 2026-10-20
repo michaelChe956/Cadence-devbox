@@ -532,7 +532,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-SvcName','Get-StackPortList','Get-RelayPorts','New-Service','New-ServiceWithHostPort','Collect-Services')) {
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-SvcName','Test-HostName','Split-AddrInput','Get-StackPortList','Get-RelayPorts','New-Service','New-ServiceWithHostPort','Collect-Services')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
@@ -559,6 +559,10 @@ $svcs = @(Collect-Services $cfg)
 Write-Host 'RESULT-BEGIN'
 foreach ($s in $svcs) {
   Write-Host ("SVC {0} {1}:{2} host={3} vm={4}" -f $s.name, $s.remoteHost, $s.remotePort, $s.hostPort, $s.vmPort)
+  # 域名段单列一行：既有 SVC 行格式保持不变（存量断言依赖），DOM 行专测 host 贯通
+  $dom = '-'
+  if ($s.PSObject.Properties['host'] -and $s.host) { $dom = $s.host }
+  Write-Host ("DOM {0} {1}" -f $s.name, $dom)
 }
 Write-Host 'RESULT-END'
 exit 0
@@ -580,11 +584,14 @@ exit 0
 """
 
 
-def _svc(name, host, remote_port, host_port, vm_port):
-    return {
+def _svc(name, host, remote_port, host_port, vm_port, *, domain=None):
+    svc = {
         "name": name, "remoteHost": host, "remotePort": remote_port,
         "hostPort": host_port, "vmPort": vm_port,
     }
+    if domain is not None:
+        svc["host"] = domain
+    return svc
 
 
 def _run_collect(tmp_path, answers, relay_json=None, mysql=None, redis=None):
@@ -740,6 +747,379 @@ def test_list_legacy_json_resolves_gateway_live(tmp_path):
     r = _run_list(tmp_path, relay_json=cfg, env_extra={"FAKE_NET_GW": "10.99.0.1"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "10.99.0.1:23306" in r.stdout, r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-20 域名同问句录入 + DNAT 映射表（设计 §5.3/§5.4/R-S1）：
+# 地址问句扩展为 "IP:端口[ 域名]"（同一问句、无二次询问），relay.ps1 生成
+# stack/data/relay-map.env 并下发 VM /etc/cadence-relay-dnat.env
+# （5 段必填 + 可选第 6 段域名，缺省用 '-' 占位）。
+
+VALID_HOSTS = ["mysql.corp.internal", "MySQL.Corp.Internal", "db2-prod", "a",
+               "zk1.corp.internal", "10x.example.com"]
+INVALID_HOSTS = ["", " ", "has space", ".leading", "trailing.", "-lead", "trail-",
+                 "a..b", "a" * 64, "10.129.12.75", "-", "my_host",
+                 ".".join(["a" * 60] * 5)]
+
+HOSTNAME_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-HostName','Split-AddrInput')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$cases = @($env:FAKE_HOST_CASES | ConvertFrom-Json)
+# 用「数组 of (case, result)」而不是 hashtable：PowerShell 的 hashtable 键
+# 大小写不敏感，"mysql.corp.internal" 与 "MySQL.Corp.Internal" 会互相覆盖，
+# 导致合法/非法用例里的同名不同大小写条目丢失。
+$res = @()
+foreach ($c in $cases) { $res += ,@{ c = "$c"; r = [bool](Test-HostName "$c") } }
+Write-Host ("RESULT=" + ($res | ConvertTo-Json -Compress -AsArray))
+exit 0
+"""
+
+SPLIT_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-HostName','Split-AddrInput')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$pairs = @($env:FAKE_SPLIT_CASES | ConvertFrom-Json)
+$out = @()
+foreach ($p in $pairs) {
+  $sp = Split-AddrInput $p[0] $p[1]
+  $out += ,@{ addr = "$($sp.addr)"; host = "$($sp.host)" }
+}
+Write-Host ("RESULT=" + ($out | ConvertTo-Json -Compress -AsArray))
+exit 0
+"""
+
+SPLIT_DIE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-HostName','Split-AddrInput')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$sp = Split-AddrInput $env:FAKE_SPLIT_RAW $env:FAKE_SPLIT_OLD
+Write-Host "UNREACHABLE addr=$($sp.addr) host=$($sp.host)"
+exit 0
+"""
+
+DNAT_MAP_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Test-SvcName','Test-AddrFormat','Test-IPv4','Test-HostName','New-DnatMapText','Write-DnatMapFile')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+# 按 relay.json 的落盘形态构造服务对象：无 host 键时对象上根本没有该属性
+$svcs = @($env:FAKE_MAP_SERVICES | ConvertFrom-Json | ForEach-Object {
+  $o = [ordered]@{
+    name = [string]$_.name; remoteHost = [string]$_.remoteHost
+    remotePort = [int]$_.remotePort; hostPort = [int]$_.hostPort; vmPort = [int]$_.vmPort
+  }
+  if ($_.PSObject.Properties['host']) { $o['host'] = [string]$_.host }
+  [pscustomobject]$o
+})
+$text = New-DnatMapText $svcs $env:FAKE_MAP_GW
+Write-DnatMapFile $text $env:FAKE_MAP_OUT
+Write-Host 'MAP_OK'
+exit 0
+"""
+
+
+def _hostname_results(tmp_path, cases):
+    r = _run_harness(HOSTNAME_HARNESS, tmp_path, env_extra={"FAKE_HOST_CASES": json.dumps(cases)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [l for l in r.stdout.splitlines() if l.startswith("RESULT=")]
+    assert lines, r.stdout
+    pairs = json.loads(lines[0][len("RESULT="):])
+    return {p["c"]: p["r"] for p in pairs}
+
+
+def _collect_domains(stdout):
+    out = {}
+    for line in stdout.splitlines():
+        if line.startswith("DOM "):
+            _, name, dom = line.strip().split(" ", 2)
+            out[name] = dom
+    return out
+
+
+def test_relay_ps1_addr_question_has_domain_slot():
+    """地址问句扩展：提示语带 "[ 域名]"，且不再出现"域名暂不支持"的旧说法。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "域名暂不支持" not in text, "地址问句仍宣称域名不支持（与同问句录域名矛盾）"
+    assert text.count("[ 域名]") >= 3, "至少 3 个问答入口（修改/自定义新增/目录新增）须带 [ 域名]"
+    for fn in ("Test-HostName", "Split-AddrInput", "New-DnatMapText", "Write-DnatMapFile"):
+        assert f"function {fn}" in text, f"relay.ps1 缺函数 {fn}"
+
+
+def test_relay_ps1_dnat_map_distribution_pins():
+    """映射表：内存 $services + $gw 渲染（不读 relay.json），先落 stack/data 再下发 VM。"""
+    ps1 = RELAY_PS1.read_text(encoding="utf-8")
+    setup = ps1.split("function Invoke-Setup", 1)[1].split("# ---- 配置清单", 1)[0]
+    assert "New-DnatMapText $services $gw" in setup, \
+        "映射表须由内存中的 $services + $gw 渲染（此时 relay.json 尚未落盘）"
+    assert "data\\relay-map.env" in setup, "映射表须落 <安装目录>\\stack\\data\\relay-map.env"
+    assert "cadence-relay-dnat.env" in setup, "映射表须下发 VM /etc/cadence-relay-dnat.env"
+    assert "Move-Item -Force" in ps1, "映射表须原子落盘（先 .tmp 再 Move-Item -Force）"
+    assert "-Encoding ascii" in ps1, "映射表须无 BOM（沿用 -Encoding ascii）"
+    # 锚点须用实际执行的 setup 命令（$setupCmd 赋值行），不能用子串
+    # "relay-vm.sh setup"——它在函数头注释里也出现过，会命中更早的位置。
+    assert setup.index("relay-map.env") < setup.index("$setupCmd = "), \
+        "映射表须在 VM setup 之前就位（setup 末尾 dnat_apply 消费它）"
+    assert setup.index("New-DnatMapText") < setup.index("ConvertTo-Json"), \
+        "映射表生成须早于 relay.json 落盘（数据源为内存 $services）"
+    assert "Undo-Portproxy" in setup, "映射表下发失败须回滚 portproxy（不留半套）"
+
+
+@needs_pwsh
+def test_host_name_accepts_valid_domains(tmp_path):
+    """合法域名：多标签/单标签/数字开头/大写（Test-HostName 不做大小写归一化）。"""
+    got = _hostname_results(tmp_path, VALID_HOSTS)
+    assert got == {h: True for h in VALID_HOSTS}, got
+
+
+@needs_pwsh
+def test_host_name_rejects_invalid_and_ip_literal(tmp_path):
+    """拒绝面：空串/空白/首尾点或横杠/连续点/单标签 >63/总长 >253/IP 字面量/-/_。"""
+    got = _hostname_results(tmp_path, INVALID_HOSTS)
+    for h in INVALID_HOSTS:
+        assert got[h] is False, f"应被拒绝却放行：{h!r}"
+
+
+SPLIT_CASES = [
+    # raw, oldHost → (addr, host)
+    ("10.1.1.1:3306", "mysql.corp.internal", "10.1.1.1:3306", "mysql.corp.internal"),
+    ("10.1.1.1:3306", "", "10.1.1.1:3306", ""),
+    ("10.2.2.2:3306 new.corp.internal", "old.corp.internal",
+     "10.2.2.2:3306", "new.corp.internal"),
+    ("  10.2.2.2:3306   New.Corp.Internal  ", "", "10.2.2.2:3306", "new.corp.internal"),
+    ("10.1.1.1:3306 -", "old.corp.internal", "10.1.1.1:3306", ""),
+    ("10.1.1.1:3306 none", "old.corp.internal", "10.1.1.1:3306", ""),
+    ("10.1.1.1:3306 NONE", "old.corp.internal", "10.1.1.1:3306", ""),
+]
+
+
+@needs_pwsh
+def test_split_addr_input_parses_domain_and_keeps_old(tmp_path):
+    """IP:端口[ 域名]：域名可选、Trim、小写归一化；缺域名沿用旧值；-/none 清空。"""
+    pairs = [[c[0], c[1]] for c in SPLIT_CASES]
+    r = _run_harness(SPLIT_HARNESS, tmp_path, env_extra={"FAKE_SPLIT_CASES": json.dumps(pairs)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = [l for l in r.stdout.splitlines() if l.startswith("RESULT=")]
+    got = json.loads(lines[0][len("RESULT="):])
+    assert [(g["addr"], g["host"]) for g in got] == [(c[2], c[3]) for c in SPLIT_CASES], got
+
+
+@needs_pwsh
+@pytest.mark.parametrize("raw,old,msg", [
+    ("", "old.corp.internal", "地址格式"),
+    ("10.1.1.1", "", "地址格式"),
+    ("10.1.1.1:3306 bad..host", "", "域名格式不合法"),
+    ("10.1.1.1:3306 10.2.2.2", "", "域名格式不合法"),
+])
+def test_split_addr_input_rejects_bad_input(tmp_path, raw, old, msg):
+    """非法输入：地址段走 Test-AddrFormat，域名段走 Test-HostName，均显式报错。"""
+    r = _run_harness(SPLIT_DIE_HARNESS, tmp_path,
+                     env_extra={"FAKE_SPLIT_RAW": raw, "FAKE_SPLIT_OLD": old})
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert msg in r.stdout, r.stdout
+    assert "UNREACHABLE" not in r.stdout, "非法输入不得返回结果"
+
+
+@needs_pwsh
+def test_collect_edit_records_domain_same_question(tmp_path):
+    """修改分支：地址问句同时录入域名 → host 贯通到服务对象。"""
+    cfg = {"version": 1, "services": [_svc("mysql", "10.1.1.1", 3306, 13306, 23306)]}
+    r = _run_collect(tmp_path, ["", "1", "10.2.2.2:3306 mysql.corp.internal", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.2.2.2:3306 host=13306 vm=23306",
+    ], r.stdout
+    assert _collect_domains(r.stdout) == {"mysql": "mysql.corp.internal"}, r.stdout
+    assert "ANSWER[10.2.2.2:3306 mysql.corp.internal]: 新远端地址（IP:端口[ 域名]" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_collect_edit_empty_reply_keeps_domain(tmp_path):
+    """修改分支回车：地址与域名都保持原值（不产生第二次询问）。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306, domain="mysql.corp.internal"),
+    ]}
+    r = _run_collect(tmp_path, ["", "1", "", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.1.1.1:3306 host=13306 vm=23306",
+    ], r.stdout
+    assert _collect_domains(r.stdout) == {"mysql": "mysql.corp.internal"}, r.stdout
+
+
+@needs_pwsh
+@pytest.mark.parametrize("reply", ["-", "none"])
+def test_collect_edit_clears_domain(tmp_path, reply):
+    """清空语义：域名段输入 "-" 或 none → 已录域名被清除（否则永远删不掉）。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306, domain="mysql.corp.internal"),
+    ]}
+    r = _run_collect(tmp_path, ["", "1", f"10.1.1.1:3306 {reply}", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_domains(r.stdout) == {"mysql": "-"}, r.stdout
+
+
+@needs_pwsh
+def test_collect_param_override_keeps_old_domain(tmp_path):
+    """-MySQL 覆盖同名服务：参数是纯 IP:端口，但旧域名不得丢。"""
+    cfg = {"version": 1, "services": [
+        _svc("mysql", "10.1.1.1", 3306, 13306, 23306, domain="mysql.corp.internal"),
+    ]}
+    r = _run_collect(tmp_path, ["", "", ""], relay_json=cfg, mysql="10.9.9.9:3306")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.9.9.9:3306 host=13306 vm=23306",
+    ], r.stdout
+    assert _collect_domains(r.stdout) == {"mysql": "mysql.corp.internal"}, r.stdout
+
+
+@needs_pwsh
+def test_collect_custom_and_catalog_record_domain(tmp_path):
+    """自定义/目录新增：同一问句录入域名并写入服务对象。
+
+    问答次序：「新增」是一次问句、逗号分隔多项（custom,kafka），
+    随后按项追问——custom 先问服务名再问地址，目录项直接问地址。
+    """
+    r = _run_collect(tmp_path, [
+        "custom,kafka",
+        "zk1", "10.1.1.5:2181 zk1.corp.internal",
+        "10.1.1.6:9092 Kafka.Corp.Internal",
+        "",
+    ])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_domains(r.stdout) == {
+        "zk1": "zk1.corp.internal",
+        "kafka": "kafka.corp.internal",
+    }, r.stdout
+
+
+@needs_pwsh
+def test_collect_legacy_json_without_host_key(tmp_path):
+    """向后兼容：旧 relay.json 无 host 键 → 正常读取，域名视为未录入。"""
+    cfg = {"version": 1, "services": [
+        {"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 3306,
+         "hostPort": 13306, "vmPort": 23306},
+    ]}
+    r = _run_collect(tmp_path, ["", "", ""], relay_json=cfg)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _collect_result_lines(r.stdout) == [
+        "SVC mysql 10.1.1.1:3306 host=13306 vm=23306",
+    ], r.stdout
+    assert _collect_domains(r.stdout) == {"mysql": "-"}, r.stdout
+
+
+@needs_pwsh
+def test_collect_invalid_domain_dies(tmp_path):
+    """问答里录入非法域名：显式报错，不产出任何结果。"""
+    r = _run_collect(tmp_path, ["custom", "zk1", "10.1.1.5:2181 bad..host"])
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "域名格式不合法" in r.stdout, r.stdout
+    assert "RESULT-BEGIN" not in r.stdout
+
+
+def _run_dnat_map(tmp_path, services, gw="10.89.0.1"):
+    out = tmp_path / "stack" / "data" / "relay-map.env"
+    env = {
+        "FAKE_MAP_SERVICES": json.dumps(services),
+        "FAKE_MAP_GW": gw,
+        "FAKE_MAP_OUT": str(out),
+    }
+    return _run_harness(DNAT_MAP_HARNESS, tmp_path, env_extra=env), out
+
+
+MAP_SERVICES = [
+    {"name": "mysql", "remoteHost": "10.129.12.75", "remotePort": 3306,
+     "hostPort": 13306, "vmPort": 23306, "host": "MySQL.Corp.Internal"},
+    {"name": "redis", "remoteHost": "10.129.20.31", "remotePort": 6379,
+     "hostPort": 16379, "vmPort": 26379},
+    {"name": "zk1", "remoteHost": "10.129.30.11", "remotePort": 2181,
+     "hostPort": 12181, "vmPort": 22181, "host": "-"},
+]
+MAP_EXPECT = [
+    ["mysql", "10.129.12.75", "3306", "10.89.0.1", "23306", "mysql.corp.internal"],
+    ["redis", "10.129.20.31", "6379", "10.89.0.1", "26379", "-"],
+    ["zk1", "10.129.30.11", "2181", "10.89.0.1", "22181", "-"],
+]
+
+
+@needs_pwsh
+def test_dnat_map_content_order_and_lf_no_bom(tmp_path):
+    """映射表：段数/顺序/域名小写/'-' 占位/无 BOM/纯 LF/原子落盘不留 .tmp。"""
+    r, out = _run_dnat_map(tmp_path, MAP_SERVICES)
+    assert r.returncode == 0 and "MAP_OK" in r.stdout, r.stdout + r.stderr
+    raw = out.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "映射表不得带 BOM"
+    assert b"\r" not in raw, "映射表须纯 LF"
+    assert raw.endswith(b"\n"), "映射表须以 LF 结尾"
+    lines = raw.decode("utf-8").splitlines()
+    # 表头是 ASCII：映射表用 -Encoding ascii 落盘（无 BOM 的既有做法，
+    # 仓库同族的 relay 服务表也用 ASCII 表头 "# name vmport bindaddr hostport"），
+    # 中文表头在 WinPS 5.1 下会被 ascii 编码成 "?"。
+    assert lines[0].startswith("# generated by relay.ps1"), lines[0]
+    assert lines[1] == "# <name> <real_ip> <real_port> <target_ip> <target_port> [domain]", lines[1]
+    data = [l.split(" ") for l in lines if not l.startswith("#")]
+    assert data == MAP_EXPECT, data
+    assert not Path(f"{out}.tmp").exists(), "原子落盘后不得残留 .tmp"
+
+
+@needs_pwsh
+def test_dnat_map_idempotent(tmp_path):
+    """幂等：同一输入重跑生成字节级一致（不追加、不去重表）。"""
+    r1, out = _run_dnat_map(tmp_path, MAP_SERVICES)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    first = out.read_bytes()
+    r2, _ = _run_dnat_map(tmp_path, MAP_SERVICES)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert out.read_bytes() == first
+
+
+@needs_pwsh
+@pytest.mark.parametrize("services,msg", [
+    ([{"name": "a1", "remoteHost": "10.1.1.1", "remotePort": 3306, "hostPort": 13306, "vmPort": 23306},
+      {"name": "a2", "remoteHost": "10.1.1.1", "remotePort": 3306, "hostPort": 13307, "vmPort": 23307}],
+     "(real_ip, real_port) 重复"),
+    ([{"name": "bad name", "remoteHost": "10.1.1.1", "remotePort": 3306,
+       "hostPort": 13306, "vmPort": 23306}], "服务名非法"),
+    ([{"name": "mysql", "remoteHost": "10.1.1.999", "remotePort": 3306,
+       "hostPort": 13306, "vmPort": 23306}], "真实 IP 非法"),
+    ([{"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 0,
+       "hostPort": 13306, "vmPort": 23306}], "real_port"),
+    ([{"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 3306,
+       "hostPort": 13306, "vmPort": 70000}], "target_port"),
+    ([{"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 3306,
+       "hostPort": 13306, "vmPort": 23306, "host": "bad..host"}], "域名非法"),
+])
+def test_dnat_map_rejects_invalid_generation(tmp_path, services, msg):
+    """生成端校验：name/IP/端口范围/(ip,port) 唯一/域名 —— 任一不满足即显式报错。"""
+    r, out = _run_dnat_map(tmp_path, services)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert msg in r.stdout, r.stdout
+    assert "MAP_OK" not in r.stdout
+    assert not out.exists(), "校验失败不得落盘半套映射表"
+
 
 # ---------------------------------------------------------------------------
 # relay-vm.sh 每服务 systemd 持久化：沙箱真实行为回归（2026-10-14 固化裁决）。
