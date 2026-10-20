@@ -346,28 +346,28 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -Teardown  # 对称�
 powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testpodman\cadence
 ```
 
-**setup 运行顺序**：远端可达预检（VPN 未连即报错退出、零改动）→ 读 podman 网桥网关 → 写 Windows portproxy（仅 127.0.0.1）→ 生成 DNAT 映射表（Windows 安装目录与 VM 侧各一份，见下节）→ `podman machine cp` 四文件 → VM 侧 `relay-vm.sh setup --retire`（末尾自动应用 DNAT 规则）→ 容器内探活 → 全部成功才落盘 relay.json。
+**setup 运行顺序**：远端可达预检（VPN 未连即报错退出、零改动）→ 读 podman 网桥网关与子网 → 写 Windows portproxy（仅 127.0.0.1）→ 生成 DNAT 映射表（Windows 安装目录与 VM 侧各一份，见下节）→ `podman machine cp` 四文件 → VM 侧 `relay-vm.sh setup --retire`（末尾自动应用 DNAT 规则）→ 容器内探活（桥接地址 + 真实地址两条证据）→ 全部成功才落盘 relay.json。
 
 #### 透明地址映射：容器内直接用真实 IP:端口
 
-> 状态（2026-10-20）：机制与命令形态已在维护者 Windows 真机探路验证（容器内对真实地址连通，探针输出 `CONNECT-OK`）；随 relay.ps1 setup 自动启用，**无独立开关、无新命令**。
+**解决什么问题**：应用里写的是公司内网**真实地址**（如 `10.129.12.75:3306`）——从配置中心拉配置的 Spring 工程尤其改不得。而容器直连这类地址不通（VPN 丢弃 NAT 转发流量，只有 Windows 宿主发起的连接被放行）。启用本能力后，**容器内照旧写真实地址即可连通**：不改工程代码、不改配置中心数据、不改容器镜像/compose，`application.yml` 里的 `10.129.12.75:3306` 原样能连。
 
-**解决什么问题**：应用里写的常是公司内网**真实地址**（如 `10.129.12.75:3306`）——从配置中心拉配置的 Spring 工程尤其改不得。而容器直连这类地址不通（VPN 丢弃 NAT 转发流量，只有 Windows 宿主发起的连接被放行）。启用本能力后，**容器内照旧写真实地址即可连通**：不改工程代码、不改配置中心数据、不改容器镜像/compose，`application.yml` 里的 `10.129.12.75:3306` 原样能连。
+真机验证（2026-10-20）：容器内 `mysql -h 10.129.12.75 -P 3306 -u <user> -p -e "SELECT 1"` 返回 `1`；`podman machine stop/start` 后规则自动重建、连接照旧。
 
-**怎么工作**：relay 通道就绪后，VM 里多一张 nft DNAT 表——容器**发往真实地址**的包进入 VM 协议栈时，被无状态改写到 relay 已有的桥接监听地址（socat 实际监听的 `网关:vmPort`），其后与 §2.6 链路完全复用：
+**怎么工作**：relay 通道就绪后，VM 里多一张 nft DNAT 表——容器发往真实地址的包进入 VM 协议栈时被无状态改写到 relay 的桥接监听地址，其后完全复用既有链路：
 
 ```text
 容器（照旧连 10.129.12.75:3306）
-  → VM nft DNAT：目标改写为 10.89.0.1:23306（relay 桥接监听）
+  → VM nft DNAT：目标改写为 10.89.0.1:23306（该服务的 relay 桥接监听地址）
   → VM socat（网关:23306）→ mirrored 回环 127.0.0.1:13306
   → Windows portproxy → VPN → 远端 10.129.12.75:3306
 ```
 
-规则全部挂在自建 `table ip cadence_dnat`（priority `dstnat - 1`，早于 podman 自带 netavark 的标准 dstnat 链，确保先改写），不碰系统其它规则；容器零特权、零改动，容器重启/重建不影响（规则在 VM 内核态，与容器生命周期无关）。
+规则挂在自建 `table ip cadence_dnat`（priority `dstnat - 1`，早于 podman netavark 的标准 dstnat 链，顺序确定），不碰系统其它规则。容器零特权、零改动；容器重启/重建不影响（规则在 VM 内核态，与容器生命周期无关）。
 
-**开启方式**：就是跑一次本节开头的 `relay.ps1` setup——同一入口、同一份配置，无新命令、无新配置文件。setup 会生成**映射表**（每行 `<服务名> <真实IP> <真实端口> <网关> <vmPort> [域名]`），一份落 `<安装目录>\stack\data\relay-map.env`，一份下发 VM `/etc/cadence-relay-dnat.env`；VM 侧 setup 末尾按表应用规则（此步失败只告警，不回滚已就绪的 relay 通道）。映射表是 relay.json 的派生物，勿手改。
+**开启方式**：跑一次本节开头的 `relay.ps1` setup——同一入口、同一份配置，**无新命令、无新配置文件**。setup 会由当前配置生成**映射表**（`<安装目录>\stack\data\relay-map.env` 一份供排查，VM `/etc/cadence-relay-dnat.env` 一份供应用规则），VM 侧 setup 末尾按表应用规则。映射表是派生物，勿手改。
 
-**地址问句带域名**：录入远端地址的问句从 `IP:端口` 扩为 `IP:端口[ 域名]`——域名是同一问句的可选第二段，不二次询问、可留空。域名仅落盘留痕（relay.json 的 `host` 字段），供诊断核对与后续域名场景，**不参与 DNAT 规则生成**（规则只按 IP 匹配）。三种真实形态：
+**地址问句带域名**：地址问句从 `IP:端口` 扩为 `IP:端口[ 域名]`——域名是同一问句的可选第二段，不二次询问、可留空。域名仅留痕（relay.json 的 `host` 字段）供诊断与后续域名场景，**不参与 DNAT 规则生成**（规则只按 IP 匹配）。
 
 ```text
 远端 kafka 地址（例如 10.129.12.75:9092，IP:端口[ 域名]）: 10.129.30.8:9092
@@ -375,36 +375,51 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 新远端地址（IP:端口[ 域名]，回车保留 10.129.12.75:3306 mysql.corp.local）: 10.129.20.88:3306 -
 ```
 
-第三行是修改已有服务：只输入地址、不带域名段 = 域名**保持原值**；要清空已录域名须显式给 `-` 或 `none`（直接回车 = 地址与域名都保持原值，清空必须有显式入口）。域名与地址同场校验，写错当场报错。
+第三行是修改已有服务：只给地址 = 域名保持原值；清空已录域名须显式给 `-` 或 `none`（直接回车 = 地址与域名都保留）。域名写错当场报错，不写半份配置。
 
-**重启后自动恢复**：nft 规则在内核态、VM 重启即丢——固化由 VM 侧负责：systemd 可用时新建单元 `cadence-relay-dnat.service`（oneshot 开机重放、ExecStop 清表）；systemd 不可用时复用既有 wsl.conf [boot] 监督循环（每轮先幂等重放规则、再巡检监听）。宿主/VM 重启后规则自动重建，**无需重跑 setup**；容器重启更无影响。查看固化状态（输出 `enabled` + `active` 即正常；boot 兜底环境无此单元，直接看下面的规则自检）：
+**重启后自动恢复**：nft 规则在内核态、VM 重启即丢，由 VM 侧固化——systemd 可用时单元 `cadence-relay-dnat.service` 开机重放（`ExecStop` 清表）；systemd 不可用时复用既有 wsl.conf `[boot]` 监督循环重放。宿主/VM 重启后无需重跑 setup，容器重启更无影响：
 
 ```powershell
 podman machine ssh 'systemctl is-enabled cadence-relay-dnat; systemctl is-active cadence-relay-dnat'
 ```
 
-**怎么确认生效**：`relay.ps1 -Status` 的 VM 侧输出末尾多一段 DNAT 诊断——规则表是否存在、逐条 `真实地址 → 网关:vmPort` 是否齐全、映射表与 relay 服务表是否一致、网关是否漂移：
+**怎么确认生效**：三条独立证据，都要看：
+
+1. setup 结束前自动探活，逐服务打印 `容器 → 真实地址 … OK（DNAT 生效）`（桥接探针只证明 relay 通，这条才证明 DNAT 生效；失败只告警，不回滚 relay）。
+2. `relay.ps1 -Status` 的 VM 段末尾带 DNAT 诊断（规则表存在性、逐条目标、映射表与服务表一致性、网关漂移）：
 
 ```text
 [cadence-relay] DNAT: mysql 10.129.12.75:3306 → 10.89.0.1:23306 OK
-[cadence-relay] DNAT: redis 10.129.20.31:6379 → 10.89.0.1:26379 OK
+[cadence-relay] DNAT: redis 10.129.117.17:6379 → 10.89.0.1:26379 OK
 ```
 
-容器内自检（`podman exec -it devbox bash` 进入后执行；对真实地址发一个 TCP 探针，输出 `CONNECT-OK` 即 DNAT 已接管，之后应用/JDBC 照旧连真实地址）：
+3. 容器内手动探针（`podman exec -it devbox bash` 进入后）：`CONNECT-OK` 即已接管，之后应用/JDBC 照旧连真实地址：
 
 ```bash
 if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo CONNECT-OK; else echo CONNECT-FAIL; fi
 ```
 
-setup 结束前也会自动做一次同样的探针并逐服务打印结果（`容器 → 真实地址 … OK（DNAT 生效）`）——它与桥接探针是两条独立证据：桥接探针只证明 relay 通道通，真实地址探针才证明 DNAT 生效。真实地址探针失败只告警、不回滚已就绪的 relay 通道。
+**排障对照表**：
 
-**怎么撤销**：`relay.ps1 -Teardown` 对称拆除——连同 DNAT 规则、VM 侧单元与两份映射表一起清。只想在 VM 侧手工回滚规则本身时（只删自有表、幂等、真机验证过的形态）：
+| 看到的输出 | 含义 | 处置 |
+|---|---|---|
+| setup：`容器 → 真实地址 … FAIL` | 改写规则未生效（relay 通道本身正常） | 重跑 `relay.ps1`，或只重建规则：`podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh dnat-apply'` |
+| `-Status`：`table ip cadence_dnat 不存在——规则缺失` | 规则缺失（VM 重启后未重放 / 曾手工清表） | 同上 |
+| `-Status`：`缺映射表 …` | 映射表缺失（派生物被清） | 重跑 `relay.ps1` |
+| `-Status`：`bind … 不在本机网卡上——网桥已重建/网关漂移` | podman 网络重建 | 重跑 `relay.ps1` 重绑 |
+| setup：`映射表跳过 X：远端端点 … 相同` | 两项服务写了同一个真实 IP:端口（DNAT 只能一条规则命中） | 正常行为，relay 通道仍可用；该服务用真实地址直连不生效，可改其中一项的端口或接受此限制 |
+| setup：`映射表跳过 X：… 落在 podman 网桥子网内` | 真实地址就在容器网段内，容器本来就直连、不经过改写点 | 正常行为，无需处理 |
+
+**怎么撤销**：`relay.ps1 -Teardown` 对称拆除（DNAT 规则、VM 侧单元与映射表、宿主侧映射表一起清）。只想手工清规则本身时（只删自有表、幂等）：
 
 ```powershell
 podman machine ssh 'sudo nft delete table ip cadence_dnat'
 ```
 
-**注意（真机踩过的坑）**：VM（Fedora podman machine）内**只有 nft、没有 iptables**——本能力用 nft 实现，不需要也不要求装 iptables。若要手工加规则：先把规则写成 `.nft` 文件（**LF 行尾**，CRLF 会被 nft 拒绝）送进 VM 后用 `sudo nft -f 文件` 加载；**不要**在 `podman machine ssh` 命令行里敲 `nft add chain ... '{ type nat hook ... }'`——花括号里的空格与分号经 Windows → bash 引号层传递会被吃掉而报语法错（真机踩过）。脚本内部即按「写临时 .nft 文件 → `nft -f`」实现，正常使用无需手工碰这些。
+**两条真机验证过的坑**：
+
+- VM（Fedora podman machine）内**只有 nft、没有 iptables**——本能力用 nft 实现，不需要也不建议装 iptables（会随 podman machine 升级丢失）。手工加规则时**不要**在 `podman machine ssh` 命令行里敲 `nft add chain ... '{ type nat hook ... }'`：花括号里的空格与分号经 Windows→bash 引号层会被吃掉而报语法错。正确形态是写 `.nft` 文件（**LF 行尾**，CRLF 会被 nft 拒绝）送进 VM 后 `sudo nft -f 文件`——脚本内部就是这么做的。
+- PowerShell 里粘贴多行命令会进 `>>` 续行模式，引号容易被弄乱；需要多行时用 here-string 或先写文件再执行。
 
 #### 查看与日常（-List / -Status）
 
