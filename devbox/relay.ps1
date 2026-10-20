@@ -716,8 +716,14 @@ function Invoke-Setup {
     if ($cur -notcontains 'relay.json') { Add-Content -Encoding ascii -Path $gi -Value 'relay.json' }
   }
 
-  Info '完成。容器内应用连接地址（podman 网桥网关，稳定）：'
-  foreach ($s in $services) { Write-Host "  $($s.name) → ${gw}:$($s.vmPort)" }
+  # 完成输出同时给两种地址：真实地址是推荐用法（应用配置照旧、零改动），
+  # 桥接地址保留兼容（旧配置/排查用）。只打桥接地址会诱导用户去改应用配置，
+  # 正是本能力要消除的动作。
+  Info '完成。应用连接地址：'
+  foreach ($s in $services) {
+    Write-Host "  $($s.name) → $($s.remoteHost):$($s.remotePort)（真实地址，推荐：应用配置照旧即可）"
+    Write-Host "           ${gw}:$($s.vmPort)（桥接地址，兼容旧配置 / 排查用）"
+  }
   if ($fail.Count -gt 0) { Warn "部分服务未通：$($fail -join '、')——先看 -Status 定位哪一跳" }
 }
 

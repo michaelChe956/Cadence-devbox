@@ -354,6 +354,14 @@ powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testp
 
 真机验证（2026-10-20）：容器内 `mysql -h 10.129.12.75 -P 3306 -u <user> -p -e "SELECT 1"` 返回 `1`；`podman machine stop/start` 后规则自动重建、连接照旧。
 
+**怎么用（三步）**：
+
+1. **跑一次 setup**（本节开头那条 `relay.ps1`），问答里录入真实地址。
+2. **应用配置一个字不动**——`application.yml` 的 `10.129.12.75:3306`、配置中心里的值、启动参数，全部保持原样。
+3. **照常启动应用**。容器内任何进程（应用、`mvn`、JDBC 客户端、诊断工具）访问该地址都会被自动接管。
+
+旧写法仍然有效：relay 通道打印的**桥接地址**（如 `10.89.0.1:23306`）继续可用，两种地址并存，不需要为了本能力迁移任何配置。
+
 **怎么工作**：relay 通道就绪后，VM 里多一张 nft DNAT 表——容器发往真实地址的包进入 VM 协议栈时被无状态改写到 relay 的桥接监听地址，其后完全复用既有链路：
 
 ```text
@@ -409,6 +417,17 @@ if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo 
 | `-Status`：`bind … 不在本机网卡上——网桥已重建/网关漂移` | podman 网络重建 | 重跑 `relay.ps1` 重绑 |
 | setup：`映射表跳过 X：远端端点 … 相同` | 两项服务写了同一个真实 IP:端口（DNAT 只能一条规则命中） | 正常行为，relay 通道仍可用；该服务用真实地址直连不生效，可改其中一项的端口或接受此限制 |
 | setup：`映射表跳过 X：… 落在 podman 网桥子网内` | 真实地址就在容器网段内，容器本来就直连、不经过改写点 | 正常行为，无需处理 |
+
+**什么时候要重跑 setup**：
+
+| 场景 | 要重跑吗 | 说明 |
+|---|---|---|
+| 改远端地址 / 新增服务 / 删除服务 | **要** | 配置变了，映射表与规则跟着重算 |
+| 重启 Windows / WSL / `podman machine` | 不要 | 规则由 VM 侧单元自动重建 |
+| 容器重建、换镜像、`podman restart` | 不要 | 规则在 VM 内核态，与容器生命周期无关 |
+| 换应用、改应用配置 | 不要 | 应用照旧写真实地址即可 |
+| VPN 重连 / 掉线恢复 | 不要 | 通道与规则都还在 |
+| podman 网络重建（网关漂移） | **要** | `-Status` 会报 `bind … 不在本机网卡上` |
 
 **怎么撤销**：`relay.ps1 -Teardown` 对称拆除（DNAT 规则、VM 侧单元与映射表、宿主侧映射表一起清）。只想手工清规则本身时（只删自有表、幂等）：
 
@@ -482,14 +501,17 @@ podman machine ssh 'sudo nft delete table ip cadence_dnat'
 [cadence-relay] 修改 mysql → 10.129.20.88:3306（host 13306 / vm 23306）
 ```
 
-**落盘与结果输出**：各服务先打印容器内探活结果（如 `mysql：容器 → 10.89.0.1:23306 OK`），全部成功后落盘 `<安装目录>\relay.json`（services 动态长度 + `gateway` 留痕）并打印容器内应用连接地址（podman 网桥网关，稳定，不随宿主 DHCP 变化）：
+**落盘与结果输出**：各服务先打印容器内探活（桥接地址与真实地址各一条），全部成功后落盘 `<安装目录>\relay.json`（services 动态长度 + `gateway` 留痕），最后打印**两种可用的连接地址**——真实地址是推荐用法（应用配置照旧），桥接地址保留兼容：
 
 ```text
-[cadence-relay] 完成。容器内应用连接地址（podman 网桥网关，稳定）：
-  mysql → 10.89.0.1:23306
-  redis → 10.89.0.1:26379
-  kafka → 10.89.0.1:29092
+[cadence-relay] 完成。应用连接地址：
+  mysql → 10.129.12.75:3306（真实地址，推荐：应用配置照旧即可）
+          10.89.0.1:23306（桥接地址，兼容旧配置 / 排查用）
+  redis → 10.129.117.17:6379（真实地址，推荐：应用配置照旧即可）
+          10.89.0.1:26379（桥接地址，兼容旧配置 / 排查用）
 ```
+
+桥接地址的网关取自 setup 时留痕的 `gateway`，稳定不随宿主 DHCP 变化。
 
 #### 端口规则（推导 + 自动顺延）
 
@@ -545,8 +567,11 @@ bash "$S" status
 ```
 
 ```powershell
+# 桥接地址（relay 通道本身）
 podman exec devbox mysql -h 10.89.0.1 -P 23306 -u root -p -e "SELECT 1"
 podman exec devbox redis-cli -h 10.89.0.1 -p 26379 --askpass PING
+# 真实地址（走 DNAT；需先按上节跑过 relay.ps1 setup 生成规则）
+podman exec devbox mysql -h 10.129.12.75 -P 3306 -u root -p -e "SELECT 1"
 ```
 
 固化结果：每服务 `cadence-relay@<name>.service`（`Restart=always`+`RestartSec=5`+`StartLimitIntervalSec=0`：开机网桥未就绪时每 5 秒自动重试直到绑定成功）。宿主/WSL 重启后无需人工干预；podman 网络重建导致网关漂移时 `status` 会明确提示重跑 setup 重绑。
