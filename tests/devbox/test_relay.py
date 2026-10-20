@@ -844,7 +844,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Test-SvcName','Test-AddrFormat','Test-IPv4','Test-HostName','New-DnatMapText','Write-DnatMapFile')) {
+foreach ($n in @('Info','Warn','Die','Test-SvcName','Test-AddrFormat','Test-IPv4','Test-HostName','ConvertTo-IPv4UInt','Test-InSubnet','New-DnatMapText','Write-DnatMapFile')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
@@ -858,7 +858,7 @@ $svcs = @($env:FAKE_MAP_SERVICES | ConvertFrom-Json | ForEach-Object {
   if ($_.PSObject.Properties['host']) { $o['host'] = [string]$_.host }
   [pscustomobject]$o
 })
-$text = New-DnatMapText $svcs $env:FAKE_MAP_GW
+$text = New-DnatMapText $svcs $env:FAKE_MAP_GW ([string]$env:FAKE_MAP_SUBNET)
 Write-DnatMapFile $text $env:FAKE_MAP_OUT
 Write-Host 'MAP_OK'
 exit 0
@@ -1063,11 +1063,12 @@ def test_collect_invalid_domain_dies(tmp_path):
     assert "RESULT-BEGIN" not in r.stdout
 
 
-def _run_dnat_map(tmp_path, services, gw="10.89.0.1"):
+def _run_dnat_map(tmp_path, services, gw="10.89.0.1", subnet=""):
     out = tmp_path / "stack" / "data" / "relay-map.env"
     env = {
         "FAKE_MAP_SERVICES": json.dumps(services),
         "FAKE_MAP_GW": gw,
+        "FAKE_MAP_SUBNET": subnet,
         "FAKE_MAP_OUT": str(out),
     }
     return _run_harness(DNAT_MAP_HARNESS, tmp_path, env_extra=env), out
@@ -1161,6 +1162,28 @@ def test_dnat_map_duplicate_endpoint_warns_and_skips(tmp_path):
     lines = out.read_text(encoding="utf-8").splitlines()
     data = [l.split(" ") for l in lines if not l.startswith("#")]
     assert data == [["mysql", "10.1.1.1", "3306", "10.89.0.1", "23306", "-"]], data
+
+
+@needs_pwsh
+def test_dnat_map_skips_real_ip_inside_bridge_subnet(tmp_path):
+    """R1：真实地址落在 podman 网桥子网内 → 改写规则无法生效，告警并跳过该条。
+
+    容器会直接经网桥访问该地址，包根本到不了 VM 的 prerouting；写进映射表只会
+    让"规则存在但永不命中"变成隐蔽故障。仍不阻断 relay（附加能力只告警）。
+    """
+    services = [
+        {"name": "mysql", "remoteHost": "10.129.12.75", "remotePort": 3306,
+         "hostPort": 13306, "vmPort": 23306},
+        {"name": "inbridge", "remoteHost": "10.89.0.9", "remotePort": 3306,
+         "hostPort": 13307, "vmPort": 23307},
+    ]
+    r, out = _run_dnat_map(tmp_path, services, subnet="10.89.0.0/24")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "映射表跳过 inbridge" in r.stdout, r.stdout
+    assert "10.89.0.0/24" in r.stdout, r.stdout
+    data = [l.split(" ") for l in out.read_text(encoding="utf-8").splitlines()
+            if not l.startswith("#")]
+    assert [d[0] for d in data] == ["mysql"], data
 
 
 @needs_pwsh

@@ -664,6 +664,12 @@ def test_setup_snapshot_restores_prior_dnat_unit(vm_factory):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "DNAT rules (old)" in vm.dnat_unit.read_text(encoding="utf-8"), \
         "快照须还原被覆盖的 dnat 单元"
+    # 断言必须落在"回滚**尝试**恢复 enabled"上：本用例让该轮所有 enable 都失败，
+    # 而回滚里的 enable 被 `|| true` 吞掉、wants 链接从头到尾没被删过——
+    # 只看链接是否存在会恒真，测不到回滚逻辑是否真的跑了。
+    calls = vm.calls()
+    assert any(c.startswith("enable cadence-relay-dnat.service") for c in calls), \
+        f"回滚须尝试恢复快照时已 enabled 的 dnat 单元：{calls}"
     assert (vm.wants_dir / "cadence-relay-dnat.service").exists(), \
         "快照时已 enabled 的单元回滚后不得被 disable"
 

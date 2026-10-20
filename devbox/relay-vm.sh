@@ -833,11 +833,9 @@ cmd_setup() {
     exit 1
   fi
   # ── DNAT 附加能力：不参与 relay 事务——失败只告警，不回滚已就绪的通道 ──
+  # 此处已在全部 rollback_setup 路径之后，后续没有任何回滚点，因此不必登记
+  # NEW_ENABLED（登记了也无人消费）。快照里已 enabled 的单元由 rollback 侧恢复。
   if [ "$use_systemd" -eq 1 ]; then
-    case " ${SNAP_ENABLED[*]:-} " in
-      *" $DNAT_UNIT_NAME "*) ;; # 快照时已 enabled：回滚侧负责恢复，不入 NEW_ENABLED
-      *) NEW_ENABLED+=("$DNAT_UNIT_NAME") ;;
-    esac
     systemctl enable --now "$DNAT_UNIT_NAME" >/dev/null 2>&1 \
       || log "警告：enable --now $DNAT_UNIT_NAME 失败（DNAT 直连暂不可用，status 会暴露）"
   fi
