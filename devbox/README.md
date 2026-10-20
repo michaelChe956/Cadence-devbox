@@ -396,6 +396,8 @@ podman machine ssh 'systemctl is-enabled cadence-relay-dnat; systemctl is-active
 if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo CONNECT-OK; else echo CONNECT-FAIL; fi
 ```
 
+setup 结束前也会自动做一次同样的探针并逐服务打印结果（`容器 → 真实地址 … OK（DNAT 生效）`）——它与桥接探针是两条独立证据：桥接探针只证明 relay 通道通，真实地址探针才证明 DNAT 生效。真实地址探针失败只告警、不回滚已就绪的 relay 通道。
+
 **怎么撤销**：`relay.ps1 -Teardown` 对称拆除——连同 DNAT 规则、VM 侧单元与两份映射表一起清。只想在 VM 侧手工回滚规则本身时（只删自有表、幂等、真机验证过的形态）：
 
 ```powershell
@@ -488,6 +490,8 @@ podman machine ssh 'sudo nft delete table ip cadence_dnat'
 | 任意 P | 127.0.0.1:P+10000 | 网关:P+20000（未顺延时） | 推导规则 |
 
 **多实例同远端端口自动顺延**：候选端口（host 或 vm 任一）命中已分配服务端口或本地 stack 发布端口（3306/6379/5672/15672/9000/9001/3000/8080）时，hostPort/vmPort 同步 +1 重试（vmPort 恒为 hostPort+10000）。多套同类型环境可并存：`mysql`（远端 3306）→ 13306/23306，再配自定义 `mysql_log`（同远端 3306）→ 自动顺延到 13307/23307；远端 rabbitmq 5672 → 越过本地管理台 15672 得 15673/25673（不再要求远端换端口）。推导值与 stack 自带中间件天然错开（如 mysql 本地 13306/容器侧 23306 vs stack 的 3306/6379），两套并存互不影响。远端端口合法范围 1-45535；顺延后 hostPort 须 ≤55535（vmPort 恒 ≤65535），越界显式报错。实际分配端口在输出与 relay.json 中明示（顺延时带「自动顺延」标记）。
+
+> **多实例同远端端点与透明地址映射**：DNAT 规则按「真实 IP:端口」匹配，一个远端端点只能有一条规则命中（先命中者胜）。因此当两项服务指向**同一个**远端 IP:端口（如 `mysql` 与 `mysql_log` 都写 `10.129.12.75:3306`）时，映射表会**告警并跳过**后一项——该服务用真实地址直连不生效，但 **relay 通道本身照常建立**（端口自动顺延不受影响），setup 不会因此失败。
 
 #### 备用入口：交互 WSL 窗口（排查或无 PowerShell 场景）
 

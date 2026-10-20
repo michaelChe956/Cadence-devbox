@@ -61,10 +61,15 @@ exit 0
 FAKE_NFT = r'''#!/bin/sh
 # 测试桩 nft：记录调用；-f 时快照规则文件并记作“已生效表”；delete 只接受
 # 自有表 cadence_dnat（其他表名直接失败，用于验证 flush 边界）；list 回放表。
+# NFT_FAIL=1 → -f 失败（验证应用失败路径与临时文件清理）；NFT_ABSENT=1 → 命令不存在。
 LOG=${NFT_LOG:?}; ST=${NFT_STATE_DIR:?}
 printf '%s\n' "$*" >>"$LOG"
 case "$1" in
   -f)
+    if [ -n "${NFT_FAIL:-}" ]; then
+      echo "桩错误：模拟 nft -f 失败" >&2
+      exit 1
+    fi
     n=$(cat "$ST/seq" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$ST/seq"
     cp "$2" "$ST/apply-$n.nft"
     cp "$2" "$ST/current.nft"
@@ -426,13 +431,18 @@ def test_dnat_apply_writes_rules_from_service_table(vm_factory):
     assert text.endswith("\n")
     assert b"\xef\xbb\xbf" not in caps[0], "规则文件不得带 BOM"
     calls = vm.nft_calls()
-    assert calls[0] == "delete table ip cadence_dnat", "先删残留表再建"
-    assert calls[1].startswith("-f "), "再整表 nft -f 应用"
+    assert calls[0] == "list table ip cadence_dnat", "先查现有表（幂等短路判定）"
+    assert calls[1] == "delete table ip cadence_dnat", "再删残留表"
+    assert calls[2].startswith("-f "), "最后整表 nft -f 应用"
 
 
 @needs_vm
 def test_dnat_apply_idempotent(vm_factory):
-    """连跑两次：生成的规则文件字节一致，nft list 输出一致。"""
+    """连跑两次：规则内容一致；第二次判定为已是最新，不重建表。
+
+    "删表 + 重建"之间存在表不存在的窗口，boot 兜底循环每 5 秒调一次本函数，
+    落在窗口内的新连接会绕过改写——因此规则未变时 MUST NOT 删表。
+    """
     vm = vm_factory()
     vm.write_services()
     vm.write_map()
@@ -441,12 +451,10 @@ def test_dnat_apply_idempotent(vm_factory):
     r = vm.run("dnat-apply")
     assert r.returncode == 0, r.stdout + r.stderr
     caps = vm.nft_captures()
-    assert len(caps) == 2
-    assert caps[0] == caps[1], "两次生成的规则必须字节一致"
+    assert len(caps) == 1, "规则未变时不得重建表"
     assert vm.nft_current() == first
-    listing = vm.run("dnat-apply")
-    assert listing.returncode == 0
-    assert len(vm.nft_deletes()) == 3, "每轮都先删表（幂等重建）"
+    assert "未改动表" in r.stdout, r.stdout
+    assert len(vm.nft_deletes()) == 1, "只在首次建表时删一次"
 
 
 @needs_vm
@@ -728,12 +736,73 @@ def test_status_flags_missing_dnat_map(vm_factory):
 
 @needs_vm
 def test_status_flags_missing_dnat_rules(vm_factory):
-    """映射表在、规则不在：status 报缺失并给出重放指引。"""
+    """映射表在、规则不在：status 报缺失并给出重放指引。
+
+    断言必须精确到 DNAT 段本身——否则会被中继段的 "VM 监听 :23306 FAIL"
+    满足（中继根本没起），DNAT 诊断即使完全写错也能过。
+    """
     vm = vm_factory()
     vm.write_services()
     vm.write_map()
     r = vm.run("status")
     out = r.stdout
-    assert "DNAT" in out
-    assert "缺失" in out or "FAIL" in out
+    assert "table ip cadence_dnat 不存在" in out, out
+    assert "dnat-apply" in out, "须给出重放指引"
     assert r.returncode == 1
+
+
+# ── 失败路径 ──────────────────────────────────────────────────────────────
+@needs_vm
+def test_dnat_apply_fails_when_nft_rejects_file(vm_factory):
+    """nft -f 失败：dnat-apply 非零退出、报明确错误、临时文件不残留。"""
+    vm = vm_factory()
+    vm.write_services()
+    vm.write_map()
+    vm.env["NFT_FAIL"] = "1"
+    r = vm.run("dnat-apply")
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "nft -f 应用失败" in (r.stdout + r.stderr), r.stdout + r.stderr
+    leftovers = list(Path(vm.env.get("TMPDIR", "/tmp")).glob("cadence-dnat.*"))
+    assert not leftovers, f"临时规则文件须清理：{leftovers}"
+
+
+@needs_vm
+def test_dnat_apply_fails_when_nft_absent(vm_factory):
+    """VM 内无 nft：明确报错并非零退出（不静默成功）。
+
+    必须把 PATH 限制到"沙箱 bin + 少量 coreutils"，否则本机 /usr/bin/nft
+    仍会被 command -v 找到，测不到"缺少 nft"这条分支。
+    """
+    vm = vm_factory()
+    vm.write_services()
+    vm.write_map()
+    core = vm.root / "corebin"
+    core.mkdir(exist_ok=True)
+    for tool in ("awk", "cut", "grep", "mktemp", "rm", "cat", "sed", "tr",
+                 "head", "tail", "sleep", "date", "mkdir", "ln", "chmod",
+                 "dirname", "basename", "env", "printf", "id", "sh", "bash"):
+        src = shutil.which(tool)
+        if not src:
+            continue
+        dst = core / tool
+        if not dst.exists():
+            dst.symlink_to(src)
+    vm.env["PATH"] = f"{vm.bin}{os.pathsep}{core}"
+    (vm.bin / "nft").unlink()   # 桩移除：PATH 里已无任何 nft
+    r = vm.run("dnat-apply")
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "缺少 nft" in (r.stdout + r.stderr), r.stdout + r.stderr
+
+
+@needs_vm
+def test_dnat_apply_skips_rebuild_when_rules_unchanged(vm_factory):
+    """规则已一致时 MUST NOT 删表重建——boot 循环每 5 秒调一次，
+    "删表 + 重建"之间存在表不存在的窗口，落在窗口内的新连接会绕过改写。"""
+    vm = vm_factory()
+    vm.write_services()
+    vm.write_map()
+    assert vm.run("dnat-apply").returncode == 0
+    deletes_after_first = len(vm.nft_deletes())
+    assert vm.run("dnat-apply").returncode == 0
+    assert len(vm.nft_deletes()) == deletes_after_first, "规则未变时不得再删表"
+    assert "未改动表" in vm.run("dnat-apply").stdout

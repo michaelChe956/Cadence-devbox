@@ -18,6 +18,8 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $InstallDir) { $InstallDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'cadence' }
 $RelayJson = Join-Path $InstallDir 'relay.json'
+# DNAT 映射表（派生物）：安装目录一份（容器可见，便于诊断），VM 侧一份（规则输入）
+$DnatMapFile = Join-Path (Join-Path $InstallDir 'stack') 'data\relay-map.env'
 
 function Info($m) { Write-Host "[cadence-relay] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[cadence-relay][警告] $m" -ForegroundColor Yellow }
@@ -490,8 +492,11 @@ function Undo-Portproxy($ports) { # 失败路径回滚已建 portproxy，避免�
 #   <name> <real_ip> <real_port> <target_ip> <target_port> [domain]
 # target_ip 写本次生成时的网桥网关（审计/漂移比对）；DNAT 规则的实际目标由 VM 侧
 # 取 relay 服务表的 bindaddr 与 vmPort，本表只作比对与诊断，不参与规则生成。
-# 生成端校验：name 合法、IP 合法、端口 1..65535、(real_ip, real_port) 唯一、
-# 域名段合法或 '-'。任一不满足即 Die（不静默跳过、不产出半套映射）。
+# 生成端校验：name 合法、IP 合法、端口 1..65535、域名段合法或 '-'。
+# (real_ip, real_port) 重复不 Die 而是告警并跳过该条：同一远端端点被两项服务
+# 共用时，nft 只能有一条规则命中（先命中者胜），两个目标不可能同时生效；
+# 但 relay 通道本身对"同远端端口多实例"是支持的（端口自动顺延），因此这里
+# MUST NOT 让 DNAT 的局限阻断 relay 建链（DNAT 是附加能力，失败只告警）。
 function New-DnatMapText($services, $gw) {
   if (-not (Test-IPv4 $gw)) { Die "网桥网关非法：$gw（无法生成映射表的 target_ip）" }
   $lines = @(
@@ -507,7 +512,10 @@ function New-DnatMapText($services, $gw) {
     if ($rp -lt 1 -or $rp -gt 65535) { Die "映射表 $($s.name) 的 real_port 超出 1-65535：$rp" }
     if ($tp -lt 1 -or $tp -gt 65535) { Die "映射表 $($s.name) 的 target_port 超出 1-65535：$tp" }
     $key = "$($s.remoteHost):$rp"
-    if ($seen.ContainsKey($key)) { Die "映射表 (real_ip, real_port) 重复：$key 同时属于 $($seen[$key]) 与 $($s.name)" }
+    if ($seen.ContainsKey($key)) {
+      Warn "映射表跳过 $($s.name)：远端端点 $key 与 $($seen[$key]) 相同，nft 只能有一条规则命中（先命中者胜）——该服务用真实地址直连不生效，relay 通道不受影响"
+      continue
+    }
     $seen[$key] = $s.name
     $dom = '-'
     $h = ''
@@ -534,6 +542,20 @@ function Write-DnatMapFile($text, $path) {
     Remove-Item -Force $tmp -ErrorAction SilentlyContinue
     throw
   }
+}
+
+# 留痕形态（relay.json）：host 仅在非空时写入——旧 relay.json 无该键等价于
+# "未录入"，读取侧按属性是否存在判空；抽出为独立函数以便行为测试直接抽取。
+function New-RelayConfig($services, $gw) {
+  $svcOut = foreach ($s in $services) {
+    $o = [ordered]@{
+      name = $s.name; remoteHost = $s.remoteHost; remotePort = $s.remotePort
+      hostPort = $s.hostPort; vmPort = $s.vmPort
+    }
+    if ($s.host) { $o['host'] = $s.host }
+    [pscustomobject]$o
+  }
+  return @{ version = 1; gateway = $gw; services = @($svcOut) }
 }
 
 # ---- 通道搭建 ----
@@ -598,7 +620,7 @@ function Invoke-Setup {
   ($retLines -join "`n") + "`n" | Set-Content -Encoding ascii -NoNewline $retireFile
   # DNAT 映射表：同一内容两份——安装目录 stack/data/（容器内只读诊断，已被 .gitignore）
   # 与 VM /etc/cadence-relay-dnat.env（dnat_apply 的输入）。无 BOM、纯 LF、原子替换。
-  $mapFile = Join-Path (Join-Path $InstallDir 'stack') 'data\relay-map.env'
+  $mapFile = $DnatMapFile
   try { Write-DnatMapFile $mapText $mapFile }
   catch { Undo-Portproxy $created; Die "映射表落盘失败（$mapFile）：$($_.Exception.Message)" }
   Info "映射表：$mapFile（$($services.Count) 条）"
@@ -615,6 +637,9 @@ function Invoke-Setup {
   $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay.retired.env /etc/cadence-relay.retired.env"
   $mvCmd = "$mvCmd && sudo mv /tmp/cadence-relay-dnat.env /etc/cadence-relay-dnat.env"
   $null = podman machine ssh $mvCmd
+  # 搬迁链的退出码 MUST 检查：链尾是映射表搬进 /etc，失败时 VM 侧仍是旧表，
+  # dnat_apply 会按旧表写规则（透明映射静默落后一版），而 relay.json 已按新意图落盘。
+  if ($LASTEXITCODE -ne 0) { Undo-Portproxy $created; Die '映射表/服务表搬迁到 /etc 失败（machine 异常？）——已回滚 portproxy' }
 
   $setupCmd = 'sudo bash /usr/local/bin/relay-vm.sh setup --retire /etc/cadence-relay.retired.env'
   $null = podman machine ssh $setupCmd
@@ -633,17 +658,21 @@ function Invoke-Setup {
     else { Warn "$($s.name)：容器 → ${gw}:$($s.vmPort) FAIL"; $fail += $s.name }
   }
 
-  # 留痕（成功才落盘，teardown 按此精确回滚）
-  # host 仅在非空时写入：旧 relay.json 无该键等价于"未录入"，读取侧按属性是否存在判空
-  $svcOut = foreach ($s in $services) {
-    $o = [ordered]@{
-      name = $s.name; remoteHost = $s.remoteHost; remotePort = $s.remotePort
-      hostPort = $s.hostPort; vmPort = $s.vmPort
+  # 透明地址探活（DNAT 用例）：容器内按**真实地址**能否连通。
+  # 这条是 DNAT 是否生效的唯一端到端证据（规则未建立/映射表陈旧时上面的桥接探活
+  # 仍会 OK）。失败只 Warn——DNAT 是附加能力，relay 通道已就绪时不该因此回滚。
+  if ($ctr) {
+    foreach ($s in $services) {
+      if (Test-ContainerPort $ctr $s.remoteHost $s.remotePort) {
+        Info "$($s.name)：容器 → 真实地址 $($s.remoteHost):$($s.remotePort) OK（DNAT 生效）"
+      } else {
+        Warn "$($s.name)：容器 → 真实地址 $($s.remoteHost):$($s.remotePort) FAIL——DNAT 未生效（relay 通道本身不受影响；重跑 relay.ps1 或 relay-vm.sh dnat-apply）"
+      }
     }
-    if ($s.host) { $o['host'] = $s.host }
-    [pscustomobject]$o
   }
-  $cfgOut = @{ version = 1; gateway = $gw; services = @($svcOut) }
+
+  # 留痕（成功才落盘，teardown 按此精确回滚）
+  $cfgOut = New-RelayConfig $services $gw
   $cfgOut | ConvertTo-Json -Depth 4 | Set-Content -Encoding ascii $RelayJson
 
   # 存量安装目录的 .gitignore 可能早于 relay 存在：补一行防误提交内网 IP 配置
@@ -688,7 +717,10 @@ function Invoke-Status {
     if ($h1) { Info "$($s.name) hop1 portproxy 127.0.0.1:$($s.hostPort) OK" }
     else { Warn "$($s.name) hop1 portproxy 缺失——重跑 setup 重建" }
   }
-  $null = podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh status'
+  # VM 侧输出 MUST 透传给用户：relay-vm.sh 的 log() 全部写 stdout，DNAT 诊断
+  # （逐条 OK / 规则缺失 / 映射表缺失 / 漂移告警）都在其中；$null = 会把它整段吞掉，
+  # 用户只看到一句无细节的提示。逐行回显。
+  podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh status' | ForEach-Object { Write-Host $_ }
   if ($LASTEXITCODE -ne 0) { Warn 'VM 侧存在 FAIL 项（见上方 [cadence-relay] 输出）' }
   $ctr = ''
   if ((Probe 'podman container inspect devbox')) { $ctr = 'devbox' }
@@ -715,8 +747,9 @@ function Invoke-Teardown {
   if (-not $cfg) { Die "无 $RelayJson——没有本脚本建立的通道可拆" }
   Write-Host '将删除：'
   foreach ($s in $cfg.services) { Write-Host "  portproxy 127.0.0.1:$($s.hostPort) → $($s.remoteHost):$($s.remotePort)" }
-  Write-Host '  VM 内 /usr/local/bin/cadence-relay-*、/etc/cadence-relay.env、wsl.conf 钩子行、socat 包'
+  Write-Host '  VM 内 /usr/local/bin/cadence-relay-*、/etc/cadence-relay.env、/etc/cadence-relay-dnat.env、DNAT 单元与 nft 表、wsl.conf 钩子行、socat 包'
   Write-Host "  $RelayJson"
+  Write-Host "  $DnatMapFile"
   $ans = Read-Host '确认拆除？(Y/N)'
   if ($ans -notmatch '^[Yy]') { Die '已取消' }
   foreach ($s in $cfg.services) {
@@ -728,6 +761,8 @@ function Invoke-Teardown {
   $null = podman machine ssh 'sudo mv /tmp/cadence-relay-vm.sh /usr/local/bin/relay-vm.sh && sudo bash /usr/local/bin/relay-vm.sh teardown'
   if ($LASTEXITCODE -ne 0) { Die 'VM 侧 teardown 失败——已保留 relay.json，恢复后重跑 -Teardown' }
   Remove-Item $RelayJson -ErrorAction SilentlyContinue
+  # 映射表是派生物：含内网地址，拆除 MUST 一并清掉（否则宿主上残留，用户以为已还原）
+  Remove-Item $DnatMapFile -ErrorAction SilentlyContinue
   Info 'teardown 完成，两侧已还原到通道建立前'
 }
 

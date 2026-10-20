@@ -816,6 +816,29 @@ Write-Host "UNREACHABLE addr=$($sp.addr) host=$($sp.host)"
 exit 0
 """
 
+RELAY_JSON_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('New-RelayConfig')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$svcs = @($env:FAKE_JOURNAL_SERVICES | ConvertFrom-Json | ForEach-Object {
+  $o = [ordered]@{
+    name = [string]$_.name; remoteHost = [string]$_.remoteHost
+    remotePort = [int]$_.remotePort; hostPort = [int]$_.hostPort; vmPort = [int]$_.vmPort
+  }
+  if ($_.PSObject.Properties['host']) { $o['host'] = [string]$_.host }
+  [pscustomobject]$o
+})
+$cfg = New-RelayConfig $svcs $env:FAKE_JOURNAL_GW
+Write-Host ("JSON=" + ($cfg | ConvertTo-Json -Depth 4 -Compress))
+exit 0
+"""
+
 DNAT_MAP_HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
@@ -875,7 +898,7 @@ def test_relay_ps1_dnat_map_distribution_pins():
     setup = ps1.split("function Invoke-Setup", 1)[1].split("# ---- 配置清单", 1)[0]
     assert "New-DnatMapText $services $gw" in setup, \
         "映射表须由内存中的 $services + $gw 渲染（此时 relay.json 尚未落盘）"
-    assert "data\\relay-map.env" in setup, "映射表须落 <安装目录>\\stack\\data\\relay-map.env"
+    assert "data\\relay-map.env" in ps1, "映射表须落 <安装目录>\\stack\\data\\relay-map.env"
     assert "cadence-relay-dnat.env" in setup, "映射表须下发 VM /etc/cadence-relay-dnat.env"
     assert "Move-Item -Force" in ps1, "映射表须原子落盘（先 .tmp 再 Move-Item -Force）"
     assert "-Encoding ascii" in ps1, "映射表须无 BOM（沿用 -Encoding ascii）"
@@ -1098,9 +1121,6 @@ def test_dnat_map_idempotent(tmp_path):
 
 @needs_pwsh
 @pytest.mark.parametrize("services,msg", [
-    ([{"name": "a1", "remoteHost": "10.1.1.1", "remotePort": 3306, "hostPort": 13306, "vmPort": 23306},
-      {"name": "a2", "remoteHost": "10.1.1.1", "remotePort": 3306, "hostPort": 13307, "vmPort": 23307}],
-     "(real_ip, real_port) 重复"),
     ([{"name": "bad name", "remoteHost": "10.1.1.1", "remotePort": 3306,
        "hostPort": 13306, "vmPort": 23306}], "服务名非法"),
     ([{"name": "mysql", "remoteHost": "10.1.1.999", "remotePort": 3306,
@@ -1113,12 +1133,58 @@ def test_dnat_map_idempotent(tmp_path):
        "hostPort": 13306, "vmPort": 23306, "host": "bad..host"}], "域名非法"),
 ])
 def test_dnat_map_rejects_invalid_generation(tmp_path, services, msg):
-    """生成端校验：name/IP/端口范围/(ip,port) 唯一/域名 —— 任一不满足即显式报错。"""
+    """生成端校验：name/IP/端口范围/域名 —— 任一不满足即显式报错。"""
     r, out = _run_dnat_map(tmp_path, services)
     assert r.returncode != 0, r.stdout + r.stderr
     assert msg in r.stdout, r.stdout
     assert "MAP_OK" not in r.stdout
     assert not out.exists(), "校验失败不得落盘半套映射表"
+
+
+@needs_pwsh
+def test_dnat_map_duplicate_endpoint_warns_and_skips(tmp_path):
+    """同一远端端点被两项服务共用：告警 + 跳过该条，MUST NOT 让 setup 中止。
+
+    relay 通道本身支持"同远端端口多实例"（端口自动顺延），因此 DNAT 的这条限制
+    MUST NOT 阻断 relay 建链（DNAT 是附加能力，失败只告警）。
+    """
+    services = [
+        {"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 3306,
+         "hostPort": 13306, "vmPort": 23306},
+        {"name": "mysql_log", "remoteHost": "10.1.1.1", "remotePort": 3306,
+         "hostPort": 13307, "vmPort": 23307},
+    ]
+    r, out = _run_dnat_map(tmp_path, services)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "映射表跳过 mysql_log" in r.stdout, r.stdout
+    assert "10.1.1.1:3306" in r.stdout, r.stdout
+    lines = out.read_text(encoding="utf-8").splitlines()
+    data = [l.split(" ") for l in lines if not l.startswith("#")]
+    assert data == [["mysql", "10.1.1.1", "3306", "10.89.0.1", "23306", "-"]], data
+
+
+@needs_pwsh
+def test_relay_json_host_key_persisted_only_when_present(tmp_path):
+    """relay.json 落盘：域名非空才写 host 键；无域名时键不存在（向后兼容）。
+
+    锁住「仅在非空时写 host 键」——回归成永远写或永远丢，现有 collect 用例
+    （只看服务对象、不看落盘）会全绿而行为已错。
+    """
+    r = _run_harness(RELAY_JSON_HARNESS, tmp_path, env_extra={
+        "FAKE_JOURNAL_SERVICES": json.dumps([
+            {"name": "mysql", "remoteHost": "10.1.1.1", "remotePort": 3306,
+             "hostPort": 13306, "vmPort": 23306, "host": "MySQL.Corp.Internal"},
+            {"name": "redis", "remoteHost": "10.2.2.2", "remotePort": 6379,
+             "hostPort": 16379, "vmPort": 26379},
+        ]),
+        "FAKE_JOURNAL_GW": "10.89.0.1",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = json.loads([l for l in r.stdout.splitlines() if l.startswith("JSON=")][0][len("JSON="):])
+    by_name = {s["name"]: s for s in cfg["services"]}
+    assert by_name["mysql"]["host"] == "MySQL.Corp.Internal", cfg
+    assert "host" not in by_name["redis"], "无域名时不得写 host 键（存量文件形态）"
+    assert cfg["version"] == 1 and cfg["gateway"] == "10.89.0.1", cfg
 
 
 # ---------------------------------------------------------------------------

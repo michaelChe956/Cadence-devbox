@@ -524,6 +524,24 @@ _dnat_apply() {
     err "映射表中的服务名全部不在 $ENV_FILE，未生成任何 DNAT 规则（重跑 relay.ps1）"
     exit 1
   fi
+  # 幂等短路：现有表已含全部期望规则时直接返回，不做"删表 + 重建"。
+  # 删表重建在两条 nft 调用之间存在"表不存在"的窗口——boot 兜底循环每 5 秒
+  # 调一次本函数，落在窗口内的新连接会绕过改写。已一致时不动表，窗口消失。
+  local cur_table='' have=0 want=0 r
+  cur_table=$(nft list table ip cadence_dnat 2>/dev/null) || cur_table=''
+  if [ -n "$cur_table" ]; then
+    for r in "${rules[@]}"; do
+      want=$((want + 1))
+      printf '%s\n' "$cur_table" | grep -qF "$r" || have=1
+    done
+    # 表内 dnat 规则条数与期望条数一致（不多不少）才算完全一致
+    local got
+    got=$(printf '%s\n' "$cur_table" | grep -c 'dnat to' || true)
+    [ "$have" -eq 0 ] && [ "$got" -eq "$want" ] && {
+      log "DNAT：规则已是最新（${#rules[@]} 条，未改动表）"
+      return 0
+    }
+  fi
   tmp=$(mktemp "${TMPDIR:-/tmp}/cadence-dnat.XXXXXX") || die "mktemp 失败（无法写 nft 规则文件）"
   {
     printf '%s\n' 'table ip cadence_dnat {'
