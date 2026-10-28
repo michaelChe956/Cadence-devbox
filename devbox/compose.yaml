@@ -28,6 +28,11 @@ volumes:
 
 services:
   devbox:
+    # 固定容器名：不依赖 compose 默认的 <项目>_<服务>_1 形式。
+    # 理由：宿主上曾同时存在手工创建的 devbox 与 compose 创建的 cadence_devbox_1，
+    # 两者挂载同一 /workspace，容器内并发 git 会撞 index.lock。固定名 + 单一创建
+    # 路径 = 至多一个 devbox 容器。
+    container_name: cadence_devbox
     image: ${CADENCE_DEVBOX_IMAGE:-cadence-devbox:1.0.0}
     init: true
     command: ["sleep", "infinity"]

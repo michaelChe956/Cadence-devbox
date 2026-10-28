@@ -168,6 +168,12 @@ function Test-AddrFormat($s) { return ($s -match '^(\d{1,3}\.){3}\d{1,3}:\d{2,5}
 
 function Test-SvcName($s) { return ($s -match '^[A-Za-z0-9_-]+$') }
 
+# 地址问句的取值指引：IP 不是"随便填个内网 IP"，而是该域名当前解析出来的地址。
+# VPN（aTrust）环境下域名型服务常解析为 198.18.x.x 假 IP——只有宿主发起的连接走隧道。
+function Write-AddressHint {
+  Write-Host '  提示：IP 用 nslookup <域名> 查（VPN 内网域名常解析为 198.18.x.x 假 IP，不是 10.x.x.x 真实内网段）' -ForegroundColor DarkGray
+}
+
 # 合法 IPv4 点分十进制（每段 0-255）：映射表 real_ip/target_ip 的生成端校验
 function Test-IPv4($s) {
   if (-not $s) { return $false }
@@ -373,6 +379,7 @@ function Collect-Services($cfg) {
     $o = $old[$k]
     $keep = "$($o.remoteHost):$($o.remotePort)"
     if ($o.host) { $keep = "$keep $($o.host)" }
+    Write-AddressHint
     $val = (Read-Host "新远端地址（IP:端口[ 域名]，回车保留 $keep）").Trim()
     if (-not $val) {
       $sp = @{ addr = "$($o.remoteHost):$($o.remotePort)"; host = $o.host }
@@ -437,6 +444,7 @@ function Collect-Services($cfg) {
       if (-not $newName) { Warn '未输入服务名，跳过自定义项'; continue }
       if (-not (Test-SvcName $newName)) { Die "服务名限字母数字与 _-：$newName" }
       if ($names.ContainsKey($newName)) { Warn "$newName 已在清单中，跳过"; continue }
+      Write-AddressHint
       $val = (Read-Host "远端 $newName 地址（IP:端口[ 域名]，域名可留空）").Trim()
       if (-not $val) { Warn "跳过 $newName（未提供地址）"; continue }
       $sp = Split-AddrInput $val ''
@@ -451,6 +459,7 @@ function Collect-Services($cfg) {
     } else {
       if ($catNames -notcontains $t) { Die "未知目录项：$t（目录：$($catNames -join ' ') 或 custom）" }
       if ($names.ContainsKey($t)) { Warn "$t 已在清单中，跳过（改地址：不保留该项后新增）"; continue }
+      Write-AddressHint
       $val = (Read-Host "远端 $t 地址（例如 10.129.12.75:$($ServiceCatalog[$t])，IP:端口[ 域名]）").Trim()
       if (-not $val) { Warn "跳过 $t（未提供地址）"; continue }
       $sp = Split-AddrInput $val ''
@@ -496,10 +505,86 @@ function Get-BridgeSubnet {
   return "$($r.out)".Trim()
 }
 
+# ---- devbox 容器定位 ----
+# 固定容器名（compose 的 container_name）：安装器与手册统一用它。
+# 探测只认「在运行」的容器——`podman container inspect` 对已停止容器同样成功，
+# 拿已停止的容器当探测目标会让所有探针打空，报出「所有通道全断」的假故障
+# （2026-10-27 真机：宿主残留一个 Exited 的 devbox 容器，16 条探针全红）。
+function Get-ContainerNames {
+  $r = RunQuiet 'podman ps -a --format "{{.Names}}"'
+  if (-not $r.ok) { return @() }
+  return @($r.out -split '\s+' | Where-Object { $_ })
+}
+
+function Get-ContainerRunning([string]$name) {
+  $r = RunQuiet "podman container inspect --format ""{{.State.Running}}"" $name"
+  if (-not $r.ok) { return $false }
+  return ($r.out.Trim() -eq 'true')
+}
+
+function Resolve-DevboxContainer {
+  # 返回 @{ name; extras; hint }：name 为空 = 没有可用的探测目标（hint 给出处置动作）。
+  $candidates = @(@(Get-ContainerNames) | Where-Object { $_ -like '*devbox*' })
+  $running = @($candidates | Where-Object { Get-ContainerRunning $_ })
+  if ($running.Count -eq 0) {
+    if ($candidates.Count -gt 0) {
+      return @{ name = ''; extras = $candidates
+                hint = "devbox 容器未运行（存在但已停止：$($candidates -join '、')）——先启动：podman start cadence_devbox" }
+    }
+    return @{ name = ''; extras = @()
+              hint = 'devbox 容器不存在：先创建（podman-compose -f stack/compose.yaml up -d devbox）' }
+  }
+  $name = if ($running -contains 'cadence_devbox') { 'cadence_devbox' } else { $running[0] }
+  $extras = @($candidates | Where-Object { $_ -ne $name })
+  $hint = ''
+  if ($running.Count -gt 1) {
+    $hint = "检测到多个在运行的 devbox 容器：$($running -join '、')——请只保留一个（它们挂载同一个 /workspace，并发 git 会撞 index.lock）"
+  } elseif ($extras.Count -gt 0) {
+    $hint = "检测到多余的 devbox 容器：$($extras -join '、')——建议清理（podman rm -f <名>），避免与 $name 争用同一 /workspace"
+  }
+  return @{ name = $name; extras = $extras; hint = $hint }
+}
+
 function Get-DevboxContainer {
-  if (Probe 'podman container inspect devbox') { return 'devbox' }
-  if (Probe 'podman container inspect cadence_devbox_1') { return 'cadence_devbox_1' }
-  Die 'devbox 容器未运行：先按手册 §2.4 启动（podman start devbox 或 compose up）'
+  $r = Resolve-DevboxContainer
+  if (-not $r.name) { Die $r.hint }
+  if ($r.hint) { Warn $r.hint }
+  if ($r.name -ne 'cadence_devbox') {
+    Warn "devbox 容器名为 $($r.name)（约定名 cadence_devbox）——建议重跑安装器统一命名"
+  }
+  return $r.name
+}
+
+# ---- 域名解析一致性核对 ----
+# 已录域名的服务：核对「该域名当前解析结果」与「已录地址」是否一致。
+# 只告警、不改写用户已录地址——用户可能故意填非解析地址（直连 IP / CDN 出口）。
+# 解析失败与「远端不可达」分开报：前者多半是 VPN 没连或域名不对。
+function Resolve-DomainIp([string]$domain) {
+  if (-not $domain) { return @{ ok = $false; msg = '未录入域名' } }
+  try {
+    $recs = @(Resolve-DnsName -Name $domain -Type A -ErrorAction Stop |
+              Where-Object { $_.IPAddress })
+    if ($recs.Count -eq 0) { return @{ ok = $false; msg = '无 A 记录' } }
+    return @{ ok = $true; ip = [string]$recs[0].IPAddress }
+  } catch {
+    return @{ ok = $false; msg = "$($_.Exception.Message)" }
+  }
+}
+
+function Check-DomainResolution($services) {
+  foreach ($s in @($services)) {
+    $domain = ''
+    if ($s.PSObject.Properties['host']) { $domain = "$($s.host)".Trim() }
+    if (-not $domain -or $domain -eq '-') { continue }
+    $r = Resolve-DomainIp $domain
+    if (-not $r.ok) {
+      Warn "$($s.name)：域名 $domain 解析失败（$($r.msg)）——请确认 VPN 已连接；不影响本次通道建立"
+      continue
+    }
+    if ($r.ip -ne $s.remoteHost) {
+      Warn "$($s.name)：域名 $domain 当前解析 $($r.ip)，与已录地址 $($s.remoteHost) 不一致——可能是地址抄错或假 IP 变了，请确认后重跑 setup"
+    }
+  }
 }
 
 function Test-ContainerPort($ctr, $gw, $port) {
@@ -596,6 +681,8 @@ function New-RelayConfig($services, $gw) {
 function Invoke-Setup {
   $cfg = Load-Config
   $services = @(Collect-Services $cfg)
+  # 动手改宿主之前先核对域名解析：地址抄错 / 假 IP 变了当场可见（只告警，不改写）
+  Check-DomainResolution $services
   # 被删/改端口服务（旧 hostPort 不在新清单，覆盖同名换端口）：预检后清 portproxy；
   # VM 侧实例随 setup 回收、boot 监听按旧表对账回收（--retire）
   $stale = @()
@@ -751,6 +838,7 @@ function Invoke-List {
 function Invoke-Status {
   $cfg = Load-Config
   if (-not $cfg) { Die "无 $RelayJson——通道未建立，先运行 setup" }
+  Check-DomainResolution @($cfg.services)
   $rules = (cmd /c 'netsh interface portproxy show all') -join "`n"
   foreach ($s in $cfg.services) {
     $h1 = ($rules -match ('(?m)^\s*127\.0\.0\.1\s+' + $s.hostPort + '\s+'))
@@ -763,8 +851,9 @@ function Invoke-Status {
   podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh status' | ForEach-Object { Write-Host $_ }
   if ($LASTEXITCODE -ne 0) { Warn 'VM 侧存在 FAIL 项（见上方 [cadence-relay] 输出）' }
   $ctr = ''
-  if ((Probe 'podman container inspect devbox')) { $ctr = 'devbox' }
-  elseif ((Probe 'podman container inspect cadence_devbox_1')) { $ctr = 'cadence_devbox_1' }
+  $res = Resolve-DevboxContainer
+  if ($res.hint) { Warn $res.hint }
+  if ($res.name) { $ctr = $res.name }
   if ($ctr -and (Probe 'podman network inspect cadence_default')) {
     $gw = Get-BridgeGateway
     foreach ($s in $cfg.services) {

@@ -382,6 +382,18 @@ def _write_stubs(bin_dir):
         '  echo "${FAKE_NET_GW:-10.89.0.1}"\n'
         "  exit 0\n"
         "fi\n"
+        'if [ "$1" = "ps" ]; then\n'
+        '  [ -n "$FAKE_PS_NAMES" ] && echo "$FAKE_PS_NAMES"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "container" ] && [ "$2" = "inspect" ]; then\n'
+        '  name="$5"\n'
+        "  key=\"FAKE_RUNNING_$(printf %s \"$name\" | tr -c 'A-Za-z0-9_' '_')\"\n"
+        '  eval "state=\\${$key:-}"\n'
+        '  [ -z "$state" ] && exit 1\n'
+        '  echo "$state"\n'
+        "  exit 0\n"
+        "fi\n"
         'echo "podman: unsupported: $*" >&2\n'
         "exit 1\n"
     )
@@ -532,7 +544,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
-foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-SvcName','Test-HostName','Split-AddrInput','Get-StackPortList','Get-RelayPorts','New-Service','New-ServiceWithHostPort','Collect-Services')) {
+foreach ($n in @('Info','Warn','Die','Test-AddrFormat','Test-SvcName','Test-HostName','Split-AddrInput','Get-StackPortList','Get-RelayPorts','New-Service','New-ServiceWithHostPort','Write-AddressHint','Collect-Services')) {
   $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
   if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
   Invoke-Expression $fs[0].Extent.Text
@@ -1911,3 +1923,107 @@ def test_vm_setup_boot_retires_removed_listeners(vm_factory):
     assert vm.pids_on_port(VM_SVC["redis"][0]) == [], "被删服务的 boot 监听须回收"
     assert stranger.pid in vm.pids_on_port(45399), "未知监听不得动"
     assert vm.pids_on_port(VM_SVC["mysql"][0]), "保留服务监听须仍在"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-28 容器探测按运行态 + 地址取值指引 + 域名解析一致性核对。
+
+CONTAINER_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','RunQuiet','Get-ContainerNames','Get-ContainerRunning','Resolve-DevboxContainer')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$r = Resolve-DevboxContainer
+Write-Host "name=$($r.name)"
+Write-Host "extras=$($r.extras -join ',')"
+Write-Host "hint=$($r.hint)"
+exit 0
+"""
+
+
+def test_relay_ps1_detects_container_running_state():
+    """容器探测必须看运行态——inspect 存在性对已停止容器同样成立。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert ".State.Running" in text, "容器探测须按 .State.Running 判定运行态"
+    assert "podman container inspect devbox" not in text, \
+        "不得再以 inspect 存在性作为探测判据（已停止容器会被选中，探针打空报假故障）"
+
+
+def test_relay_ps1_uses_fixed_container_name():
+    """relay.ps1 须认固定容器名。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "cadence_devbox" in text, "relay.ps1 须使用固定容器名 cadence_devbox"
+
+
+def test_relay_ps1_address_question_shows_lookup_hint():
+    """地址问句须告诉用户 IP 从哪查，并说明 VPN 下是假 IP。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "nslookup" in text, "地址问句须提示用 nslookup 查 IP"
+    assert "198.18" in text, "须说明 VPN 下域名型服务常解析为 198.18.x.x 假 IP"
+
+
+def test_relay_ps1_checks_domain_resolution():
+    """已录域名的服务须做解析一致性核对。"""
+    text = RELAY_PS1.read_text(encoding="utf-8")
+    assert "Resolve-DnsName" in text, "须做域名解析一致性核对"
+
+
+@needs_pwsh
+def test_resolve_devbox_container_selects_running_container(tmp_path):
+    """在运行的容器被选中；别的容器不当探测目标。"""
+    r = _run_harness(CONTAINER_HARNESS, tmp_path, env_extra={
+        "FAKE_PS_NAMES": "cadence_devbox cadence_mysql_1 cadence_redis_1",
+        "FAKE_RUNNING_cadence_devbox": "true",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "name=cadence_devbox" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_resolve_devbox_container_reports_stopped_container(tmp_path):
+    """只有已停止的容器：不得选中它，须报未运行并给启动命令。"""
+    r = _run_harness(CONTAINER_HARNESS, tmp_path, env_extra={
+        "FAKE_PS_NAMES": "cadence_devbox",
+        "FAKE_RUNNING_cadence_devbox": "false",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "name=\n" in r.stdout, "已停止容器不得被当作探测目标"
+    assert "未运行" in r.stdout and "podman start" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_resolve_devbox_container_reports_missing_container(tmp_path):
+    """没有 devbox 容器：报不存在并给创建命令。"""
+    r = _run_harness(CONTAINER_HARNESS, tmp_path, env_extra={"FAKE_PS_NAMES": ""})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "不存在" in r.stdout and "up -d devbox" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_resolve_devbox_container_reports_multiple_containers(tmp_path):
+    """多个 devbox 容器在运行：明确报告，同时继续探测固定名那个。"""
+    r = _run_harness(CONTAINER_HARNESS, tmp_path, env_extra={
+        "FAKE_PS_NAMES": "cadence_devbox devbox",
+        "FAKE_RUNNING_cadence_devbox": "true",
+        "FAKE_RUNNING_devbox": "true",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "多个" in r.stdout, r.stdout
+    assert "name=cadence_devbox" in r.stdout, r.stdout
+
+
+@needs_pwsh
+def test_resolve_devbox_container_reports_extra_stopped_container(tmp_path):
+    """另有一个已停止的 devbox 容器：报告多余容器，同时继续探测在跑的那个。"""
+    r = _run_harness(CONTAINER_HARNESS, tmp_path, env_extra={
+        "FAKE_PS_NAMES": "cadence_devbox devbox-old",
+        "FAKE_RUNNING_cadence_devbox": "true",
+    })
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "name=cadence_devbox" in r.stdout, r.stdout
+    assert "devbox-old" in r.stdout, r.stdout

@@ -13,11 +13,14 @@ import tarfile
 import time
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parents[2]
 JDK = REPO / "devbox" / "jdk.sh"
 SHIM = REPO / "devbox" / "jdk-shim.sh"
 DOCKERFILE = REPO / "devbox" / "Dockerfile"
 INSTALL_PS1 = REPO / "devbox" / "install.ps1"
+COMPOSE = REPO / "devbox" / "compose.yaml"
 
 BUILTIN_MAJOR = "21"
 
@@ -640,6 +643,13 @@ def test_image_installs_fail_closed_jdk_tool_shims():
 
 
 def test_windows_installer_precreates_and_mounts_jdk_volume():
+    """JDK 选择跨容器重建保留：安装器预建卷 + compose 的 devbox 服务挂载该卷。
+
+    devbox 容器只经 compose 创建（2026-10-28 收口），挂载断言落在 compose 侧。
+    """
     text = INSTALL_PS1.read_text(encoding="utf-8")
     assert "'cadence-jdks'" in text, "安装器必须预建 JDK 状态卷（external 卷 compose 不创建）"
-    assert "-v cadence-jdks:/home/dev/.cadence/jdks" in text, "直接 podman run 必须显式挂载该卷"
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    volumes = compose["services"]["devbox"]["volumes"]
+    assert "cadence-jdks:/home/dev/.cadence/jdks" in volumes, \
+        "compose 的 devbox 服务必须挂载 JDK 状态卷（否则 jdk use 的选择在重建后丢失）"

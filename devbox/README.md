@@ -246,31 +246,31 @@ agents:
   omp:    { provider: relay1, model: glm-5.3 }
 ```
 
-> ⚠️ 此文件=密钥，勿提交勿分享。换 key/换模型改这里，**`podman stop devbox` + `podman start devbox` 生效**（实测 `podman restart` 不会重跑 entrypoint 渲染，配置不生效）。
+> ⚠️ 此文件=密钥，勿提交勿分享。换 key/换模型改这里，**`podman stop cadence_devbox` + `podman start cadence_devbox` 生效**（实测 `podman restart` 不会重跑 entrypoint 渲染，配置不生效）。
 
 ### 2.4 启动与首验（podman 拓扑）
 
-**中间件走 podman-compose，devbox 单独 `podman run`**（实测拓扑；Windows/macOS 的 machine 默认 rootful，路径由 podman 自动映射进 machine）：
+**中间件与 devbox 全部走 podman-compose**（同一个项目 `cadence`；Windows/macOS 的 machine 默认 rootful，路径由 podman 自动映射进 machine）：
 
 ```powershell
 cd C:\cadence\stack
-podman-compose -f compose.yaml up -d mysql redis     # 中间件（按 .env 的 PROFILES 增减）
+podman-compose -f compose.yaml up -d          # 中间件 + devbox（按 .env 的 PROFILES 增减）
+# 或分开起：
+podman-compose -f compose.yaml up -d mysql redis   # 中间件
+podman-compose -f compose.yaml up -d devbox        # devbox 容器
 
-podman run -d --name devbox --network cadence_default `
-  -v C:\cadence\cadence-box.yaml:/cadence/auth.yaml:ro `
-  -v C:\cadence\stack:/cadence/stack `
-  -v D:\code:/workspace `
-  -v cadence-jdks:/home/dev/.cadence/jdks `
-  -v /var/run/podman/podman.sock:/var/run/docker.sock `
-  -p 127.0.0.1:3000:3000 -p 127.0.0.1:8080:8080 `
-  ghcr.io/michaelche956/cadence-devbox:latest
-
-podman logs devbox | Select-Object -Last 3     # 应见「就绪」
-podman exec -it devbox bash                    # 进入容器
+podman logs cadence_devbox | Select-Object -Last 3     # 应见「就绪」
+podman exec -it cadence_devbox bash                   # 进入容器
 ```
 
-- `-v cadence-jdks:/home/dev/.cadence/jdks` 是 **JDK 选择的状态卷**（§3.1）：不挂它就只是容器内临时状态，`podman rm` 重建后回到内置 21。卷需先按 §2.2 第 4 步预建。
-- 挂载取舍：`podman run` 路线只挂**必需项**（鉴权文件、stack、workspace、JDK 状态卷）；`compose.yaml` 的 devbox 服务还会把另外 16 个缓存/登录态卷（`.claude`/`.codex`/`.m2`/…）一起挂上，让登录态与依赖缓存在容器重建后仍在。两条路线都能跑——五端配置每次启动都会按 `cadence-box.yaml` 重新渲染。
+- **devbox 容器只有这一条创建路径**，容器名固定为 `cadence_devbox`（compose 的 `container_name`）。不要再手工 `podman run` 造一个 devbox 容器：两个容器会挂载同一个 `/workspace`，容器内并发 git 会撞 `index.lock`。安装器（`install.ps1`）会先清理历史遗留的 devbox 容器（早期手工路线与 compose 默认名），再创建固定名容器，并断言 devbox 类容器至多一个。
+- **升级到固定名版本的老安装目录**：安装器**不覆盖**已存在的 `stack\compose.yaml`（保留你 `stack add` 自加的服务），所以固定容器名不会自动生效——手动替换一次即可：
+  ```powershell
+  Copy-Item D:\testpodman\Cadence-devbox\devbox\compose.yaml D:\testpodman\cadence\stack\compose.yaml -Force
+  ```
+  替换后再跑 `podman-compose -f compose.yaml up -d devbox`，容器名才会变成 `cadence_devbox`。
+- 挂载由 compose 统一定义：鉴权文件、stack、`/workspace`、JDK 选择状态卷（`cadence-jdks`，§3.1），以及 12 个 agent 登录态与语言缓存卷（`.claude`/`.codex`/`.pi`/`.kimi`/`.agents`/`.omp`/`.m2`/`.gradle`/`.npm`/`.npm-global`/`.cache/uv`/`.cache/pip`）——登录态与依赖缓存在容器重建后仍在。五端配置每次启动都会按 `cadence-box.yaml` 重新渲染。
+- 容器重建（改名、删除后重建、镜像升级）不影响 `/workspace` 里的仓库：它是宿主 bind mount。
 
 macOS/Linux 同命令（路径换 `~/cadence/...`；Linux 需加 `--userns=keep-id`，见 §2.5）。
 
@@ -297,7 +297,14 @@ systemctl --user enable --now podman.socket
 printf 'unqualified-search-registries = ["docker.m.daocloud.io", "docker.io"]\n' >> ~/.config/containers/registries.conf
 ```
 
-Linux 下 devbox 启动命令在 §2.4 基础上**必须加 `--userns=keep-id`**，sock 挂载源用 `$XDG_RUNTIME_DIR/podman/podman.sock`。
+Linux rootless 下 compose 创建的 devbox 同样需要 keep-id 用户命名空间——写进 §2.5 的 `~/.config/containers/containers.conf` 即可（比逐条命令加参数省事）：
+
+```toml
+[containers]
+userns = "keep-id"
+```
+
+sock 挂载源用 `$XDG_RUNTIME_DIR/podman/podman.sock`。
 
 **平台差异与验证状态**：
 
@@ -323,7 +330,7 @@ stack 命令（status/restart/logs）已按 label 直连 docker 兼容 API 适�
 - Windows + Podman Desktop，podman machine 为 **WSL 后端**（其他后端明确拒绝）
 - 管理员权限（脚本自动请求 UAC 提权）
 - stack 已起（§2.4）——网桥网关来自 `cadence_default` 网络
-- devbox 容器在运行（容器名以实际为准：`devbox` 或 `cadence_devbox_1`，脚本自动探测）
+- devbox 容器在运行（固定容器名 `cadence_devbox`；脚本按**运行态**探测——容器未运行会明确提示"先启动"，不会再被当成探测目标打出满屏 FAIL）
 
 **链路**（4 跳）：容器 → VM socat（绑网桥网关，每服务一个 systemd 单元）→ mirrored 回环 127.0.0.1 → Windows portproxy → VPN → 远端；VM 侧 systemd 优先（`Restart=always` 自恢复），wsl.conf [boot] 兜底为 5 秒巡检的监督循环（等价自恢复；存在外来 [boot] 段时显式失败）。
 
@@ -401,7 +408,7 @@ podman machine ssh 'systemctl is-enabled cadence-relay-dnat; systemctl is-active
 [cadence-relay] DNAT: redis 10.129.117.17:6379 → 10.89.0.1:26379 OK
 ```
 
-3. 容器内手动探针（`podman exec -it devbox bash` 进入后）：`CONNECT-OK` 即已接管，之后应用/JDBC 照旧连真实地址：
+3. 容器内手动探针（`podman exec -it cadence_devbox bash` 进入后）：`CONNECT-OK` 即已接管，之后应用/JDBC 照旧连真实地址：
 
 ```bash
 if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo CONNECT-OK; else echo CONNECT-FAIL; fi
@@ -411,6 +418,11 @@ if timeout 5 bash -c 'echo > /dev/tcp/10.129.12.75/3306' 2>/dev/null; then echo 
 
 | 看到的输出 | 含义 | 处置 |
 |---|---|---|
+| setup / `-Status`：`devbox 容器未运行（存在但已停止：…）` | 容器停了——脚本不会拿停止的容器当探测目标 | `podman start cadence_devbox` |
+| setup / `-Status`：`devbox 容器不存在` | 容器没建 | `podman-compose -f stack/compose.yaml up -d devbox` |
+| setup / `-Status`：`检测到多个…devbox 容器` | 历史上并存过手工容器与 compose 容器，两者挂同一 `/workspace` | 删到只剩一个：`podman rm -f <多余容器名>` |
+| setup / `-Status`：`域名 X 当前解析 A，与已录地址 B 不一致` | 地址抄错，或 VPN 重连后假 IP 变了 | 确认后重跑 setup（问句里的 IP 重新 `nslookup` 一次） |
+| setup / `-Status`：`域名 X 解析失败` | 多半是 VPN 没连或域名写错 | 连上 VPN 再跑一次 |
 | setup：`容器 → 真实地址 … FAIL` | 改写规则未生效（relay 通道本身正常） | 重跑 `relay.ps1`，或只重建规则：`podman machine ssh 'sudo bash /usr/local/bin/relay-vm.sh dnat-apply'` |
 | `-Status`：`table ip cadence_dnat 不存在——规则缺失` | 规则缺失（VM 重启后未重放 / 曾手工清表） | 同上 |
 | `-Status`：`缺映射表 …` | 映射表缺失（派生物被清） | 重跑 `relay.ps1` |
@@ -439,6 +451,31 @@ podman machine ssh 'sudo nft delete table ip cadence_dnat'
 
 - VM（Fedora podman machine）内**只有 nft、没有 iptables**——本能力用 nft 实现，不需要也不建议装 iptables（会随 podman machine 升级丢失）。手工加规则时**不要**在 `podman machine ssh` 命令行里敲 `nft add chain ... '{ type nat hook ... }'`：花括号里的空格与分号经 Windows→bash 引号层会被吃掉而报语法错。正确形态是写 `.nft` 文件（**LF 行尾**，CRLF 会被 nft 拒绝）送进 VM 后 `sudo nft -f 文件`——脚本内部就是这么做的。
 - PowerShell 里粘贴多行命令会进 `>>` 续行模式，引号容易被弄乱；需要多行时用 here-string 或先写文件再执行。
+
+#### VPN 侧 HTTP 服务（GitLab / Artifactory）
+
+容器里 `git clone` / `git fetch` 走的是同一条 relay 通道——容器直连 VPN 网段不通（aTrust 丢弃一切 NAT 转发流量，只有宿主发起的连接走隧道）。域名型服务还多一层：它们在宿主 DNS 上被 aTrust 解析成**假 IP**（`198.18.x.x`），容器拿到同一个假 IP，但只有宿主能连。
+
+三步：
+
+```powershell
+# 1) 查这个域名当前解析成什么（VPN 下通常是假 IP）
+nslookup gitlab.tianti.tg.unicom.local
+#    → Address: 198.18.0.2
+
+# 2) 加一条通道：relay.ps1 问答填 custom → 服务名 → "198.18.0.2:80 gitlab.tianti.tg.unicom.local"
+powershell -ExecutionPolicy Bypass -File .\devbox\relay.ps1 -InstallDir D:\testpodman\cadence
+
+# 3) 容器内直接用（不改任何 git 配置）
+podman exec -it cadence_devbox git -C /workspace/authority fetch origin
+```
+
+要点：
+
+- **域名和 IP 一起填**：问句接受 `IP:端口 域名`；域名留痕后，setup 与 `-Status` 会核对「当前解析结果 vs 已录地址」，不一致当场告警（只告警，**不改写**你已填的地址）。
+- **HTTP Host 头保持不变**：改写只换目标 IP，请求里的 `Host: gitlab…` 原样保留，所以 GitLab 的虚拟主机匹配正常。
+- **假 IP 变了怎么办**：VPN 重连后假 IP 可能变 → 容器里 `git fetch` 超时 → 重新 `nslookup` 一次、重跑 `relay.ps1`（幂等，约 30 秒）。
+- **凭据**：不要把口令写进 remote URL；容器内用 `git config --global credential.helper store`（明文存 `~/.git-credentials`，记得 `chmod 600`）。
 
 #### 查看与日常（-List / -Status）
 
@@ -568,10 +605,10 @@ bash "$S" status
 
 ```powershell
 # 桥接地址（relay 通道本身）
-podman exec devbox mysql -h 10.89.0.1 -P 23306 -u root -p -e "SELECT 1"
-podman exec devbox redis-cli -h 10.89.0.1 -p 26379 --askpass PING
+podman exec cadence_devbox mysql -h 10.89.0.1 -P 23306 -u root -p -e "SELECT 1"
+podman exec cadence_devbox redis-cli -h 10.89.0.1 -P 26379 --askpass PING
 # 真实地址（走 DNAT；需先按上节跑过 relay.ps1 setup 生成规则）
-podman exec devbox mysql -h 10.129.12.75 -P 3306 -u root -p -e "SELECT 1"
+podman exec cadence_devbox mysql -h 10.129.12.75 -P 3306 -u root -p -e "SELECT 1"
 ```
 
 固化结果：每服务 `cadence-relay@<name>.service`（`Restart=always`+`RestartSec=5`+`StartLimitIntervalSec=0`：开机网桥未就绪时每 5 秒自动重试直到绑定成功）。宿主/WSL 重启后无需人工干预；podman 网络重建导致网关漂移时 `status` 会明确提示重跑 setup 重绑。
@@ -600,14 +637,14 @@ bash "$S" teardown
 
 | 场景 | 操作 |
 |---|---|
-| 每天开工 | `podman-compose -f compose.yaml up -d`（在 stack 目录；二次启动秒级）+ `podman start devbox` |
-| 进入容器 | `podman exec -it devbox bash`，然后直接 `claude` / `codex` / `pi` / `kimi` / `omp` |
-| 换 key/换模型 | 改 `..\cadence-box.yaml` → `podman stop devbox` + `podman start devbox`（勿用 `restart`，实测不重渲染） |
+| 每天开工 | `podman-compose -f compose.yaml up -d`（在 stack 目录；二次启动秒级）+ `podman start cadence_devbox` |
+| 进入容器 | `podman exec -it cadence_devbox bash`，然后直接 `claude` / `codex` / `pi` / `kimi` / `omp` |
+| 换 key/换模型 | 改 `..\cadence-box.yaml` → `podman stop cadence_devbox` + `podman start cadence_devbox`（勿用 `restart`，实测不重渲染） |
 | 中间件增删启停 | 容器内 `stack` 命令（见 §4），或直接对 agent 说「加个 kafka」「重启 mysql」 |
 | 跑项目 | 容器内 `app run myapp -- mvn spring-boot:run`（后台+日志+端口探活），或让 agent 全权 |
 | 切 JDK 版本 | 容器内 `jdk list` / `jdk use 8` / `jdk use 21`（见 §3.1；默认内置 Temurin 21，选择跨重建保留） |
 | 宿主工具连库 | Navicat 连 `127.0.0.1:3306`（root/cadence123）；浏览器开 `localhost:3000/8080` |
-| 下班 | `podman stop devbox` + `podman-compose -f compose.yaml stop`——凭据/依赖缓存/中间件数据全在卷里，不丢 |
+| 下班 | `podman stop cadence_devbox` + `podman-compose -f compose.yaml stop`——凭据/依赖缓存/中间件数据全在卷里，不丢 |
 
 代码工作方式：宿主 IDE 照常编辑 `D:\code`（或 `~/code`）下的仓库，容器内 agent/构建实时看到同一工作树（bind 双向共享）；push 在宿主 git 客户端完成。
 
@@ -625,7 +662,7 @@ jdk use 8         # 切到 OpenJDK 8；没装过时先按需下载安装（见 �
 |---|---|
 | 全新安装（状态卷为空） | 容器首启自动选**内置 21**；启动日志：`未发现已有 JDK 选择——初始化为镜像内置 21` |
 | 已选过版本 → 重建容器/升级镜像 | 沿用上次选择；启动日志：`已有 JDK 选择有效：主版本 …——保留` |
-| 命令一致性 | `java`/`javac`/`mvn` 等一律读固定的 `JAVA_HOME=/home/dev/.cadence/jdks/current`，`current/bin` 在 `PATH` 前部：**非交互** `podman exec devbox java -version`（不读 `.bashrc`）、交互式 shell、容器内 agent 拿到的都是同一个版本 |
+| 命令一致性 | `java`/`javac`/`mvn` 等一律读固定的 `JAVA_HOME=/home/dev/.cadence/jdks/current`，`current/bin` 在 `PATH` 前部：**非交互** `podman exec cadence_devbox java -version`（不读 `.bashrc`）、交互式 shell、容器内 agent 拿到的都是同一个版本 |
 | 已运行的 JVM | **不受切换影响**（切换只原子替换 `current` 链接，不改已启动进程的 `java.home`） |
 | 切回 / 卸载 | `jdk use 21` 切回；想删掉 8：先 `jdk use 21`，再 `sudo rm -rf /home/dev/.cadence/jdks/8`（不能删当前选中的目录） |
 
@@ -825,7 +862,7 @@ PR 要求：本地 `uv run --with pytest --with pyyaml python -m pytest tests/de
 cd <安装目录>/stack
 # 改 .env 中 CADENCE_DEVBOX_IMAGE 为新周版 tag（如 :2026.38），然后：
 podman pull crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:2026.38
-podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚本）
+podman rm -f cadence_devbox && # 按启动命令重建（建议存成 start-devbox 脚本）
 # 离线路线：podman load -i 新包，改 .env 指向新 tag，重建 devbox
 ```
 
@@ -843,7 +880,7 @@ podman rm -f devbox && # 按启动命令重建（建议存成 start-devbox 脚�
 
 - **回滚不删卷**：JDK 状态卷（已安装的 8 + `current` 选择）留在原处；旧镜像不认识 `jdk` 命令、只继续用内置 21，不会破坏卷内容——再升回新镜像时选择仍在。
 - 内置 21 的目录若随镜像升级改名，entrypoint 会识别并**迁移指向内置 21 的选择**；额外安装的 8 不受影响。
-- 卸载该特性：`podman volume rm cadence-jdks`（会一并删掉已安装的 8；容器正在用时先 `podman rm -f devbox`）。
+- 卸载该特性：`podman volume rm cadence-jdks`（会一并删掉已安装的 8；容器正在用时先 `podman rm -f cadence_devbox`）。
 
 ## 7. FAQ
 

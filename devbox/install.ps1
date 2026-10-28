@@ -168,37 +168,49 @@ if (-not (Probe "podman image inspect $Image")) {
 }
 podman-compose -f "$InstallDir\stack\compose.yaml" up -d mysql redis
 if ($LASTEXITCODE -ne 0) { Die '中间件启动失败：请把上方错误反馈维护者' }
-if (Probe 'podman container inspect devbox') { podman rm -f devbox | Out-Null }
-podman run -d --name devbox --network cadence_default `
-  -v "$InstallDir\cadence-box.yaml:/cadence/auth.yaml:ro" `
-  -v "$InstallDir\stack:/cadence/stack" `
-  -v "${Workspace}:/workspace" `
-  -v /var/run/podman/podman.sock:/var/run/docker.sock `
-  -v cadence-jdks:/home/dev/.cadence/jdks `
-  -p 127.0.0.1:3000:3000 -p 127.0.0.1:8080:8080 `
-  $Image
-if ($LASTEXITCODE -ne 0) { Die 'devbox 启动失败：请把上方错误反馈维护者' }
+# devbox 容器只经 compose 创建（固定容器名 cadence_devbox）。
+# 历史上手工 `podman run --name devbox` 造出的容器与 compose 造的容器会并存，
+# 两者挂载同一 /workspace——容器内并发 git 会撞 index.lock。故先清理遗留名。
+foreach ($legacy in @('devbox', 'cadence_devbox_1')) {
+  if (Probe "podman container inspect $legacy") {
+    podman rm -f $legacy | Out-Null
+    Info "已清理遗留 devbox 容器：$legacy"
+  }
+}
+podman-compose -f "$InstallDir\stack\compose.yaml" up -d devbox
+if ($LASTEXITCODE -ne 0) { Die 'devbox 启动失败：compose 创建 devbox 失败，请把上方错误反馈维护者' }
+# 唯一性断言：devbox 类容器至多一个（多个 = 同一 /workspace 被重复挂载）
+$devboxCtrs = @(podman ps -a --format '{{.Names}}' | Where-Object { $_ -like '*devbox*' })
+if ($devboxCtrs.Count -gt 1) {
+  Die "检测到多个 devbox 容器（$($devboxCtrs -join '、')）——它们挂载同一个 /workspace，并发 git 会撞 index.lock。请先清理到只剩一个：podman rm -f <容器名>"
+}
+$DevboxCtr = 'cadence_devbox'
+if ($devboxCtrs.Count -eq 1 -and $devboxCtrs[0] -ne $DevboxCtr) {
+  # podman-compose 不支持 container_name 时的兜底：用实际容器名继续，但明确告警
+  Warn "compose 未按固定名创建容器（实际 $($devboxCtrs[0])）——当前 podman-compose 可能不支持 container_name"
+  $DevboxCtr = $devboxCtrs[0]
+}
 Info '等待 devbox 就绪（entrypoint 首启渲染五端配置）…'
 $ready = $false
 foreach ($i in 1..30) {
   Start-Sleep -Seconds 1
   $ErrorActionPreference = 'Continue'
-  $log = (podman logs devbox 2>&1 | Out-String)
+  $log = (podman logs $DevboxCtr 2>&1 | Out-String)
   $ErrorActionPreference = 'Stop'
   if ($log -match '就绪') { $ready = $true; break }
 }
 if ($ready) { Info 'devbox 已就绪（日志含「就绪」）' }
-else { Warn '30 秒内未见就绪日志，稍后手动查看：podman logs devbox' }
+else { Warn "30 秒内未见就绪日志，稍后手动查看：podman logs $DevboxCtr" }
 
 # ---- 第 5 步：后续提示 ----
 Info '第 5/5 步：完成。后续操作：'
 Write-Host @"
-  1. 进入容器：podman exec -it devbox bash
+  1. 进入容器：podman exec -it $DevboxCtr bash
      首验：claude --version && stack status && ls /workspace
   2. 你的全部仓库在容器内 /workspace 下，与 Windows 双向同步
-  3. 换 key/换模型：改 $InstallDir\cadence-box.yaml → podman stop devbox + podman start devbox（勿用 restart）
+  3. 换 key/换模型：改 $InstallDir\cadence-box.yaml → podman stop $DevboxCtr + podman start $DevboxCtr（勿用 restart）
   4. 加开中间件（容器内）：stack enable mq   # rabbitmq；stack enable storage   # minio
-  5. 日常开关：podman stop devbox / podman start devbox（machine 随 Podman Desktop 起）
+  5. 日常开关：podman stop $DevboxCtr / podman start $DevboxCtr（machine 随 Podman Desktop 起）
   6. 要连公司远端中间件（VPN 侧 MySQL/Redis）：.\devbox\relay.ps1（手册 §2.6）
 "@
 Info '安装完成。'
