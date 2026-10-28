@@ -41,11 +41,13 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 
 首跑 MUST 以问答收集中间件远端地址并保存到安装目录的配置文件；重跑 MUST 回显已有通道（编号）并允许保留/删除/修改/新增；MUST 同时支持命令行参数覆盖问答。服务清单 MUST 为动态长度：新增服务从目录（mysql/redis/kafka/zookeeper/rabbitmq）多选或走自定义（服务名+IP:端口）。
 
+#### Scenario: 重跑 setup 删除服务
+- **WHEN** 已有 mysql/redis 通道，重跑 setup 时仅保留 mysql（redis 被删除）
+- **THEN** Windows 侧 redis 的 portproxy 规则被删除；VM 侧 systemd 实例被本次 setup 回收（停监听、清 wants 链接），无 systemd 的 boot 兜底模式下其 socat 监听由 setup 按旧服务表对账回收（三参核验，未知不动）；mysql 通道不受影响
+
+### Requirement: 端口推导与顺延
+
 通道端口 MUST 按远端端口推导：hostPort=远端端口+10000、vmPort=hostPort+10000（即未顺延时与存量 +20000 值一致）。候选端口（hostPort 或 vmPort 任一）命中已分配服务端口或本地 stack 发布端口时，两者 MUST 同步顺延 +1 重试直至无冲突（vmPort 恒为 hostPort+10000）。分配 MUST 按服务在清单中的顺序进行（保留项在前、参数项次之、新增项最后），同一输入序列的结果 MUST 确定且重跑稳定，relay.json 服务顺序 MUST 保持。远端端口合法范围 MUST 为 1-45535；顺延后 hostPort MUST ≤55535（vmPort 恒 ≤65535），越界 MUST 显式报错说明并终止。
-
-未修改的保留项 MUST 沿用 relay.json 旧端口，不重新推导；新分配只影响新增项、参数项与交互修改项。setup 完成时输出与 relay.json MUST 明示每个服务实际分配的 host/vm 端口。重跑问答 MUST 在保留序号之后、新增之前支持交互修改保留项：逐项询问新远端地址（回车=保留原值）与新本地端口（回车=按当前占用自动顺延推导；输入数字则显式覆盖），显式覆盖 MUST 校验端口范围（1-55535）、不撞本地 stack 发布端口、不与其他服务端口重复，violation 时 MUST 显式报错说明冲突双方。
-
-远端地址的问句 MUST 接受「IP:端口」与「IP:端口 域名」两种形态，域名与地址 MUST 在**同一次问句**录入，MUST NOT 产生第二次询问，MUST NOT 要求用户手工编辑配置文件补录。回车 MUST 保持地址与域名的原值；域名 MUST 提供显式清空入口（用户 MUST 能删除已录入的域名）。域名 MUST 通过合法性校验（非法域名当场报错说明），MUST NOT 静默接受。域名 MUST NOT 参与改写规则的生成（规则按 IP 匹配），仅作留痕与诊断用途。存量配置文件（无域名信息）MUST 继续正常工作，MUST NOT 因新增域名能力而要求用户迁移或重录。
 
 #### Scenario: 修改远端地址
 - **WHEN** 用户重跑 setup 并将 mysql 远端地址改为新值（远端端口随之变化）
@@ -62,6 +64,10 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 #### Scenario: 顺延越界显式拒绝
 - **WHEN** 远端端口 45535 的推导端口（host 55535 / vm 65535）已被占用，顺延将使 vmPort 超过 65535
 - **THEN** setup 显式报错说明顺延越界（hostPort 须 ≤55535），不创建任何 portproxy 或 VM 内文件
+
+### Requirement: 保留项与交互修改
+
+未修改的保留项 MUST 沿用 relay.json 旧端口，不重新推导；新分配只影响新增项、参数项与交互修改项。setup 完成时输出与 relay.json MUST 明示每个服务实际分配的 host/vm 端口。重跑问答 MUST 在保留序号之后、新增之前支持交互修改保留项：逐项询问新远端地址（回车=保留原值）与新本地端口（回车=按当前占用自动顺延推导；输入数字则显式覆盖），显式覆盖 MUST 校验端口范围（1-55535）、不撞本地 stack 发布端口、不与其他服务端口重复，violation 时 MUST 显式报错说明冲突双方。
 
 #### Scenario: 保留项沿用旧端口且重跑稳定
 - **WHEN** relay.json 已有多服务（含顺延后的端口），用户重跑 setup 全部保留、不新增不修改
@@ -91,9 +97,9 @@ setup MUST 在建立前检测配置端口上的既有监听；发现非本脚本
 - **WHEN** 用户在修改问答中输入的本地端口（或其 vmPort=hostPort+10000）与其他服务已分配端口重复
 - **THEN** setup 显式报错说明与哪项服务冲突并终止，不创建任何 portproxy 或 VM 内文件
 
-#### Scenario: 重跑 setup 删除服务
-- **WHEN** 已有 mysql/redis 通道，重跑 setup 时仅保留 mysql（redis 被删除）
-- **THEN** Windows 侧 redis 的 portproxy 规则被删除；VM 侧 systemd 实例被本次 setup 回收（停监听、清 wants 链接），无 systemd 的 boot 兜底模式下其 socat 监听由 setup 按旧服务表对账回收（三参核验，未知不动）；mysql 通道不受影响
+### Requirement: 远端地址问句与域名留痕
+
+远端地址的问句 MUST 接受「IP:端口」与「IP:端口 域名」两种形态，域名与地址 MUST 在**同一次问句**录入，MUST NOT 产生第二次询问，MUST NOT 要求用户手工编辑配置文件补录。回车 MUST 保持地址与域名的原值；域名 MUST 提供显式清空入口（用户 MUST 能删除已录入的域名）。域名 MUST 通过合法性校验（非法域名当场报错说明），MUST NOT 静默接受。域名 MUST NOT 参与改写规则的生成（规则按 IP 匹配），仅作留痕与诊断用途。存量配置文件（无域名信息）MUST 继续正常工作，MUST NOT 因新增域名能力而要求用户迁移或重录。
 
 #### Scenario: 同一次问句录入域名
 - **WHEN** 用户在新增或修改服务的地址问句中输入「IP:端口 域名」
@@ -209,14 +215,6 @@ setup MUST 在 relay 通道建立后，于 VM 侧应用一条无状态目的地�
 
 改写的目标地址 MUST 取自 relay 服务表中该服务的**实际监听地址**（中继进程真实绑定的地址与端口），MUST NOT 取自现查的网桥网关或其它推导值——目标必须是「改写后有人接」的地址。
 
-MUST NOT 修改：应用工程代码与配置文件、配置中心的数据、容器镜像与 compose 定义、容器启动参数。应用 MUST 能继续使用其原有的真实地址配置。
-
-改写规则 MUST 只作用于配置中列出的服务，MUST NOT 劫持其它目的地址或协议的流量。
-
-MUST NOT 依赖容器内特权：改写规则 MUST 完全在 VM 侧生效，容器 MUST NOT 需要 `NET_ADMIN` 等额外能力。
-
-当两项服务指向同一真实 IP:端口时，MUST NOT 因此阻断 relay 通道建立（改写是附加能力，其局限 MUST 只以告警呈现）。
-
 #### Scenario: 容器内按真实地址连通远端 MySQL
 - **WHEN** 用户在 relay 配置中录入 mysql=10.129.12.75:3306 并完成 setup，随后在容器内以真实地址发起连接（`mysql -h 10.129.12.75 -P 3306 -u <user> -p -e "SELECT 1"`）
 - **THEN** 连接成功建立并通过认证，查询返回结果（如 `1`），全程未修改任何应用配置或配置中心数据
@@ -224,6 +222,16 @@ MUST NOT 依赖容器内特权：改写规则 MUST 完全在 VM 侧生效，容�
 #### Scenario: 改写目标恒等于中继的实际监听地址
 - **WHEN** 用户重跑 setup 导致映射表记录的目标与 relay 服务表中该服务的实际监听地址不一致（如网桥重建后网关漂移）
 - **THEN** 规则仍按服务表中的实际监听地址改写（保证改写后有中继接住），同时输出告警说明两者不一致并提示重跑 setup；MUST NOT 静默改指其它地址
+
+### Requirement: 改写的作用边界与不变量
+
+MUST NOT 修改：应用工程代码与配置文件、配置中心的数据、容器镜像与 compose 定义、容器启动参数。应用 MUST 能继续使用其原有的真实地址配置。
+
+改写规则 MUST 只作用于配置中列出的服务，MUST NOT 劫持其它目的地址或协议的流量。
+
+MUST NOT 依赖容器内特权：改写规则 MUST 完全在 VM 侧生效，容器 MUST NOT 需要 `NET_ADMIN` 等额外能力。
+
+当两项服务指向同一真实 IP:端口时，MUST NOT 因此阻断 relay 通道建立（改写是附加能力，其局限 MUST 只以告警呈现）。
 
 #### Scenario: 未列出的地址不被劫持
 - **WHEN** 容器内进程连接一个未在 relay 配置中列出的地址

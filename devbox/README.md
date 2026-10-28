@@ -915,6 +915,11 @@ podman rm -f cadence_devbox && # 按启动命令重建（建议存成 start-devb
     podman start cadence_devbox
     ```
     也可以用运行中的容器直接修：`podman exec -u root cadence_devbox chown -R dev:dev /home/dev/.cadence` 然后 `podman stop cadence_devbox; podman start cadence_devbox`
+14. **容器启动日志报 `skills 安装/更新失败`（`set: pipefail: invalid option name`）**：Cadence-skills 的 `install.sh` 第 2 行是 `set -euo pipefail`，报错说明那次执行的 shell 不认 `pipefail`（根因未定位；`POSIXLY_CORRECT`、`bash --posix`、`dash` 三种假设都已试过、均不复现）。容器与 agent 照常可用，只是 skills 没自动更新。手动补一次：
+    ```powershell
+    podman exec -it cadence_devbox bash -lc 'cd ~/.agents/Cadence-skills && git pull --ff-only && bash install.sh'
+    ```
+    新版 entrypoint 已加「首跑失败 → 换 `/bin/bash` 重试 → 仍失败则打印 shell 路径/版本与脚本头 3 行」的诊断，随下一个镜像生效
 
 ## 8. Windows 真机验收（已执行：2026-09-21，维护者 michaelChe）
 

@@ -93,6 +93,24 @@ function Resolve-EnvImage([string]$envPath, [string]$defaultImage) {
   return $defaultImage
 }
 
+# 本地 compose.yaml 带固定容器名时，必须挡住 entrypoint 的模板同步：
+# 镜像内置模板在改动前构建、没有 container_name，覆盖后容器名会退回 compose 默认名
+# （compose 默认名 = <项目>_<服务>_1，与旧容器并存会重复挂载同一 /workspace）。
+# 手段是 stack\CHANGES.md——entrypoint 见到它就整段跳过模板同步。返回 $true 表示本次新建。
+function Protect-StackTemplate([string]$stackDir) {
+  $compose = Join-Path $stackDir 'compose.yaml'
+  $marker = Join-Path $stackDir 'CHANGES.md'
+  if (-not (Test-Path $compose)) { return $false }
+  if (-not (Select-String -Path $compose -Pattern '^\s*container_name:' -Quiet)) { return $false }
+  if (Test-Path $marker) { return $false }
+  @(
+    '# 本地改动记录（有本文件时 entrypoint 不再用镜像内置模板覆盖本目录）'
+    ''
+    '- compose.yaml：devbox 服务固定容器名 cadence_devbox（旧镜像模板缺该行，覆盖后容器名会回落）'
+  ) | Set-Content -Encoding utf8 $marker
+  return $true
+}
+
 # .env：工作区/镜像/启用 profile（默认空=仅 mysql+redis）——已存在则保留，防抹掉用户启用的 profile
 if (Test-Path "$InstallDir\stack\.env") {
   Warn "stack\.env 已存在，保留不覆盖（改工作区/镜像请手动编辑它）"
@@ -103,6 +121,9 @@ if (Test-Path "$InstallDir\stack\.env") {
 }
 # 本地 .gitignore（安装目录不是 git 仓库时亦预留）
 "cadence-box.yaml`nstack/.env`nstack/CHANGES.md`nstack/data/`nrelay.json`n" | Set-Content "$InstallDir\.gitignore" -Encoding ascii
+if (Protect-StackTemplate "$InstallDir\stack") {
+  Info '已生成 stack\CHANGES.md：保护 compose.yaml 里的固定容器名不被镜像内置模板覆盖'
+}
 Info "请编辑 $InstallDir\cadence-box.yaml 填写 provider 端点/key/模型（git.name/email 也要填）"
 $done = Read-Host '填完后按回车继续（Ctrl+C 退出先去填）'
 

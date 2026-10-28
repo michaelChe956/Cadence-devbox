@@ -401,7 +401,7 @@ def _write_stubs(bin_dir):
         f.chmod(0o755)
 
 
-def _run_harness(harness_text, tmp_path, *, env_extra=None):
+def _run_harness(harness_text, tmp_path, *, env_extra=None, script=RELAY_PS1):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     _write_stubs(bin_dir)
@@ -417,7 +417,7 @@ def _run_harness(harness_text, tmp_path, *, env_extra=None):
     )
     env.update(env_extra or {})
     return subprocess.run(
-        [PWSH, "-NoProfile", "-File", str(harness), str(RELAY_PS1)],
+        [PWSH, "-NoProfile", "-File", str(harness), str(script)],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -2054,7 +2054,8 @@ exit 0
 @needs_pwsh
 def test_resolve_env_image_backfills_then_reuses(tmp_path):
     """`.env` 缺镜像键→补写默认值；已有值→沿用（不被新默认值覆盖），且不重复追加。"""
-    r = _run_harness(ENV_IMAGE_HARNESS, tmp_path, env_extra={"FAKE_ENV_DIR": str(tmp_path)})
+    r = _run_harness(ENV_IMAGE_HARNESS, tmp_path,
+                     env_extra={"FAKE_ENV_DIR": str(tmp_path)}, script=INSTALL_PS1)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "IMG1=repo/devbox:latest" in r.stdout, r.stdout
     assert "IMG2=repo/devbox:latest" in r.stdout, "已有键必须沿用，不被新默认值覆盖"

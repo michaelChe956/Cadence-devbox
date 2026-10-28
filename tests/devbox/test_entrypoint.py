@@ -170,3 +170,30 @@ def test_jdk_state_defaults_preserved_and_corruption_reported(tmp_path):
     log = (home / ".cadence/logs/entrypoint.log").read_text()
     assert "损坏" in log and "未自动重置" in log
     assert os.readlink(root / "current") == str(broken), "损坏状态不得被悄悄重置"
+
+
+def test_skills_installer_retries_with_diagnostics(tmp_path):
+    """skills 安装脚本首跑失败 → 换 /bin/bash 重试；仍失败则打 shell 版本与脚本头（可定位）。"""
+    text = ENTRY.read_text(encoding="utf-8")
+    helper = text.split("run_skills_installer()", 1)[1].split("\nboot_skills()", 1)[0]
+    good = tmp_path / "good.sh"
+    good.write_text("#!/usr/bin/env bash\nset -euo pipefail\necho INSTALLER_OK\n", encoding="utf-8")
+    bad = tmp_path / "bad.sh"
+    bad.write_text("#!/usr/bin/env bash\necho 'set: pipefail: invalid option name' >&2\nexit 7\n",
+                   encoding="utf-8")
+    harness = tmp_path / "h.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "log() { printf '[log] %s\\n' \"$*\"; }\n"
+        "run_skills_installer()" + helper + "\n"
+        "run_skills_installer \"$1\"; r1=$?\n"
+        "run_skills_installer \"$2\"; r2=$?\n"
+        "echo \"RC=$r1,$r2\"\n",
+        encoding="utf-8")
+    r = subprocess.run(["bash", str(harness), str(good), str(bad)],
+                       capture_output=True, text=True, timeout=120)
+    out = r.stdout + r.stderr
+    assert "INSTALLER_OK" in out, out
+    assert "用 /bin/bash 重试" in out, f"失败后须重试并留痕：{out}"
+    assert "重试仍失败" in out, f"二次失败须打诊断：{out}"
+    assert "RC=0,1" in out, out

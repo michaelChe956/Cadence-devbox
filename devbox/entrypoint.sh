@@ -100,15 +100,29 @@ else
 fi
 
 # ---------- 步骤 5：skills 首启安装/幂等更新（软失败） ----------
+# 2026-10-28 Windows 真机：首跑报 `install.sh: line 2: set: pipefail: invalid option name`
+# （脚本第 2 行是 `set -euo pipefail`，说明那次执行的 shell 不认 pipefail；根因未定位，
+#  POSIXLY_CORRECT / bash --posix / dash 三种假设均已在本机试过、均不复现）。
+# 处置：首跑失败后换绝对路径 /bin/bash + 清掉 POSIXLY_CORRECT 重试一次；
+# 仍失败则把 shell 路径、版本与脚本头 3 行打进日志，供下次直接定位。
+run_skills_installer() {
+  local script=$1
+  bash "$script" && return 0
+  log "警告：skills 安装脚本首跑失败（shell=$(command -v bash)，$(bash --version | head -1)），用 /bin/bash 重试"
+  env -u POSIXLY_CORRECT /bin/bash "$script" && return 0
+  log "警告：重试仍失败；脚本开头：$(head -3 "$script" | tr '\n' ' ')"
+  return 1
+}
+
 boot_skills() {
   local repo="$HOME_DIR/.agents/Cadence-skills" url
   if [ -d "$repo/.git" ]; then
     git -C "$repo" pull --ff-only || return 1
-    bash "$repo/install.sh" || return 1
+    run_skills_installer "$repo/install.sh" || return 1
   else
     for url in "${CADENCE_INSTALL_MIRRORS[@]}"; do
       curl -fsSL --retry 2 --max-time 60 "$url" -o /tmp/cadence-install.sh || continue
-      bash /tmp/cadence-install.sh && return 0
+      run_skills_installer /tmp/cadence-install.sh && return 0
     done
     return 1
   fi
