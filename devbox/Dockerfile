@@ -81,19 +81,39 @@ RUN pip3 install --break-system-packages --no-cache-dir \
 # 2026-09-11 实测：omp 官方安装器走 GitHub releases/bun.sh，构建网络不可达；npm 包 @oh-my-pi/pi-coding-agent 与 bun 均在 npmmirror，改走 npm（版本 pin 见 versions.env）。
 # 注意 prefix：node 为 /opt tarball 安装，npm 默认全局 prefix 会解析到 /opt/node-*/（PATH 外）——必须显式 set prefix /usr/local。
 # --omit=optional：omp 的 optionalDependencies（sherpa-onnx-node 本地语音、@huggingface/transformers）数百 MB，非核心功能，砍。
-RUN npm config set registry https://registry.npmmirror.com \
- && npm config set prefix /usr/local \
- && npm install -g --omit=optional \
+# 2026-10-28 构建实测：五个包放在同一次 npm install 里会长时间无进展（>20 分钟、磁盘零增长）。
+# 改为**五个独立 prefix 并行安装 + 串行合并**：npm 对同一 prefix 的 node_modules 与 bin 链接没有跨进程锁，
+# 并发写同一 prefix 会互相踩坏（bin 丢失 / 包目录半成品）；独立 prefix 并发是安全的，合并阶段单进程串行。
+# 同时显式限制 fetch 超时与重试——源卡住时快速失败重试，而不是无限等。
+RUN set -eux; \
+    npm config set registry https://registry.npmmirror.com; \
+    rm -rf /opt/npm-par; mkdir -p /opt/npm-par; \
+    specs=( \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "@earendil-works/pi-coding-agent@${PI_VERSION}" \
       "bun@${BUN_VERSION}" \
-      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
- && npm cache clean --force \
- && rm -rf /usr/local/lib/node_modules/@oh-my-pi/pi-coding-agent/node_modules/onnxruntime-node \
-           /usr/local/lib/node_modules/@oh-my-pi/pi-coding-agent/node_modules/sherpa-onnx-* \
- && ls /usr/local/bin/ | grep -E '^(claude|codex|pi|omp|bun)$' \
- && rm -f /root/.npmrc
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" ); \
+    i=0; \
+    for spec in "${specs[@]}"; do \
+      i=$((i+1)); \
+      echo "== 并行安装 [$i/${#specs[@]}] $spec"; \
+      npm install -g --prefix "/opt/npm-par/$i" --omit=optional --no-audit --no-fund \
+        --fetch-retries=3 --fetch-timeout=120000 --maxsockets=20 "$spec" & \
+    done; \
+    wait; \
+    echo "== 把各 prefix 的 bin 链接到 /usr/local/bin（用 npm 自己建的链接，不手工合并 node_modules）"; \
+    for pfx in /opt/npm-par/*; do \
+      for b in "$pfx"/bin/*; do \
+        [ -e "$b" ] || continue; \
+        ln -sf "$(readlink -f "$b")" "/usr/local/bin/$(basename "$b")"; \
+      done; \
+    done; \
+    rm -rf /opt/npm-par/*/lib/node_modules/@oh-my-pi/pi-coding-agent/node_modules/onnxruntime-node \
+           /opt/npm-par/*/lib/node_modules/@oh-my-pi/pi-coding-agent/node_modules/sherpa-onnx-*; \
+    npm cache clean --force; \
+    for b in claude codex pi omp bun; do test -e "/usr/local/bin/$b" || { echo "缺少 $b"; exit 1; }; done; \
+    rm -f /root/.npmrc
 # kimi（月之光自有 CDN）；omp 已并入上方 npm 批次
 ENV HOME=/home/dev
 USER dev
