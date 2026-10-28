@@ -1,0 +1,98 @@
+name: devbox image publish
+
+# 手动触发的镜像发布：构建 devbox 镜像并推送到 ACR。
+#
+# 为什么需要它：镜像里内置了构建时的 stack 模板（compose.yaml / docker-compose.no-sock.yml / catalog），
+# entrypoint 启动时会把它们同步到安装目录。所以改了这些模板（例如给 compose.yaml 加 container_name）
+# 之后，只有重新构建镜像、让新模板进入镜像，"旧安装目录 + CHANGES.md" 的临时兜底才可以撤掉。
+#
+# 使用前提（仓库 Settings → Secrets and variables → Actions）：
+#   ACR_IMAGE    完整镜像名（不含 tag），如 crpi-xxxx.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox
+#   ACR_USERNAME ACR 用户名
+#   ACR_PASSWORD ACR 密码 / 访问令牌
+#
+# 触发：Actions → devbox image publish → Run workflow → 填 tag（如 2026.44）
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '目标 tag（如 2026.44；滚动发布用 latest）'
+        required: true
+        default: latest
+      also_latest:
+        description: '同时更新 latest'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build & push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 预检 secrets
+        env:
+          ACR_IMAGE: ${{ secrets.ACR_IMAGE }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for k in ACR_IMAGE ACR_USERNAME ACR_PASSWORD; do
+            if [ -z "${!k:-}" ]; then
+              echo "::error::缺少 secrets.$k：请在仓库 Settings → Secrets and variables → Actions 配置（ACR_IMAGE 形如 <registry>/cadence/devbox）"
+              exit 1
+            fi
+          done
+
+      - name: 安装 podman
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes podman
+
+      - name: 构建镜像
+        env:
+          ACR_IMAGE: ${{ secrets.ACR_IMAGE }}
+        run: |
+          set -euo pipefail
+          # 去掉 `# syntax=docker/dockerfile:1`：BuildKit 前端指令在 podman/buildah 下会尝试拉取
+          # docker/dockerfile:1，构建机上不一定可达；Dockerfile 只用标准指令，直接跑即可。
+          sed '1{/^# syntax=/d}' devbox/Dockerfile > /tmp/Dockerfile.build
+          podman build -f /tmp/Dockerfile.build -t "${ACR_IMAGE}:${{ inputs.tag }}" devbox
+          podman run --rm --entrypoint test "${ACR_IMAGE}:${{ inputs.tag }}" -d /home/dev/.cadence
+          podman run --rm --entrypoint test "${ACR_IMAGE}:${{ inputs.tag }}" -f /opt/cadence/stack/compose.yaml
+          echo "构建完成：${ACR_IMAGE}:${{ inputs.tag }}"
+
+      - name: 登录并推送
+        env:
+          ACR_IMAGE: ${{ secrets.ACR_IMAGE }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          registry="${ACR_IMAGE%%/*}"
+          echo "$ACR_PASSWORD" | podman login --username "$ACR_USERNAME" --password-stdin "$registry"
+          podman push "${ACR_IMAGE}:${{ inputs.tag }}"
+          if [ "${{ inputs.also_latest }}" = "true" ] && [ "${{ inputs.tag }}" != "latest" ]; then
+            podman tag "${ACR_IMAGE}:${{ inputs.tag }}" "${ACR_IMAGE}:latest"
+            podman push "${ACR_IMAGE}:latest"
+          fi
+          podman logout "$registry" || true
+
+      - name: 发布结果
+        env:
+          ACR_IMAGE: ${{ secrets.ACR_IMAGE }}
+        run: |
+          {
+            echo "### 已发布"
+            echo ""
+            echo "- 镜像：\`${ACR_IMAGE}:${{ inputs.tag }}\`"
+            if [ "${{ inputs.also_latest }}" = "true" ]; then echo "- 同时更新：\`${ACR_IMAGE}:latest\`"; fi
+            echo ""
+            echo "升级客户端：改安装目录 \`stack/.env\` 的 \`CADENCE_DEVBOX_IMAGE\` → \`podman-compose -f compose.yaml up -d devbox\`"
+          } >> "$GITHUB_STEP_SUMMARY"

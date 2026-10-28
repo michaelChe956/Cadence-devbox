@@ -991,3 +991,33 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 - 版本清单：容器内 `cat /opt/cadence/versions.txt`
 - 源：apt/pypi=aliyun，maven=aliyun（原 USTC 因容器 TLS 指纹被 CF 误杀），node=npmmirror，npm=registry.npmmirror.com，omp/bun=npmmirror（官方安装器走 GitHub 不可达）
 - omp 本地语音/视觉依赖（onnxruntime/sherpa-onnx，568MB）已按需裁剪；需要时容器内 `npm i -g` 补装
+
+### 9.1 构建与发布（维护者手动，无自动周构建）
+
+镜像**不在 CI 里自动构建**：`.github/workflows/devbox-ci.yml` 只跑 pytest + shellcheck。发布有两条路：
+
+**A. 一键发布（推荐）：GitHub Actions 手动触发**
+
+`Actions → devbox image publish → Run workflow`，填 tag（如 `2026.44`）。首次使用需先在仓库
+`Settings → Secrets and variables → Actions` 配三个 secret：
+
+| secret | 内容 |
+|---|---|
+| `ACR_IMAGE` | 完整镜像名（不含 tag），如 `<registry>/cadence/devbox` |
+| `ACR_USERNAME` | ACR 用户名 |
+| `ACR_PASSWORD` | ACR 密码 / 访问令牌 |
+
+工作流会构建、验证两个关键路径（`/home/dev/.cadence` 存在、`/opt/cadence/stack/compose.yaml` 存在）、推送，并在 Summary 里给出升级命令。
+
+**B. 本地构建并推送**（需要 ACR 写权限）
+
+```bash
+# 在 Linux（或 WSL）侧执行；构建上下文是 devbox/
+podman build -f devbox/Dockerfile -t <registry>/cadence/devbox:2026.44 devbox
+podman push <registry>/cadence/devbox:2026.44
+```
+
+**为什么必须重新构建镜像才能撤掉 `CHANGES.md`**：镜像里内置了构建时的 `stack/` 模板
+（`compose.yaml` / `docker-compose.no-sock.yml` / `catalog`），entrypoint 每次启动会把它们同步
+到安装目录。改了模板文件（例如给 `compose.yaml` 加 `container_name`）后，只有新镜像才带新模板；
+在那之前，安装目录用 `stack\CHANGES.md` 挡住同步（见 FAQ 12）。
