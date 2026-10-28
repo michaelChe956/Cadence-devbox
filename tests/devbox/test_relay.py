@@ -2027,3 +2027,35 @@ def test_resolve_devbox_container_reports_extra_stopped_container(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "name=cadence_devbox" in r.stdout, r.stdout
     assert "devbox-old" in r.stdout, r.stdout
+
+
+ENV_IMAGE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { Write-Host "PARSE_ERROR: $($errors[0].Message)"; exit 2 }
+foreach ($n in @('Info','Warn','Die','Resolve-EnvImage')) {
+  $fs = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq $n }, $true)
+  if (-not $fs) { Write-Host "MISSING_FUNC: $n"; exit 3 }
+  Invoke-Expression $fs[0].Extent.Text
+}
+$envFile = Join-Path $env:FAKE_ENV_DIR '.env'
+"CADENCE_WORKSPACE=D:/ws`nCOMPOSE_PROFILES=" | Set-Content -Encoding ascii $envFile
+$first = Resolve-EnvImage $envFile 'repo/devbox:latest'
+Write-Host "IMG1=$first"
+$second = Resolve-EnvImage $envFile 'other:tag'
+Write-Host "IMG2=$second"
+$lines = @(Get-Content $envFile | Where-Object { $_ -like 'CADENCE_DEVBOX_IMAGE=*' })
+Write-Host "KEYS=$($lines.Count) VALUE=$($lines -join ',')"
+exit 0
+"""
+
+
+@needs_pwsh
+def test_resolve_env_image_backfills_then_reuses(tmp_path):
+    """`.env` 缺镜像键→补写默认值；已有值→沿用（不被新默认值覆盖），且不重复追加。"""
+    r = _run_harness(ENV_IMAGE_HARNESS, tmp_path, env_extra={"FAKE_ENV_DIR": str(tmp_path)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "IMG1=repo/devbox:latest" in r.stdout, r.stdout
+    assert "IMG2=repo/devbox:latest" in r.stdout, "已有键必须沿用，不被新默认值覆盖"
+    assert "KEYS=1 VALUE=CADENCE_DEVBOX_IMAGE=repo/devbox:latest" in r.stdout, r.stdout

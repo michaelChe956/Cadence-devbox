@@ -92,6 +92,8 @@ powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 
 参数：`-Workspace`（代码父目录，不传则交互询问）、`-InstallDir`（默认 devbox 旁 `cadence\`）、`-Image`（默认 ACR 地址，见 §1 路线 A）。
 
+> ⚠️ **已有安装目录在别处时必须显式传 `-InstallDir`**（如 `-InstallDir D:\testpodman\cadence`）：默认值只认「`devbox\` 的上一层 + `cadence`」，不传就会在仓库里装出**第二套**（旧 compose.yaml 无固定容器名、`.env` 不重新生成，症状是容器名回落 + 启动失败）。
+
 脚本自动做的 5 步：
 
 | 步 | 内容 | 对应手工段落 |
@@ -952,6 +954,31 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 > 第 3 项的时间门与第 4 项的 5 秒热更为设计「七、验证口径」的验收门槛，本次按维护者确认为通过。
 >
 > **范围说明**：上表是**一期**验收（2026-09-21），当时镜像尚无 §3.1 的 JDK 选择特性；该特性在 Windows 上**尚未真机验证**——`install.ps1` 的 `cadence-jdks` 预建与 `podman run -v` 挂载只做过静态核对，Windows 端口只到「静态断言通过」，不构成真机 E2E 结论。
+
+### 8.3 变更验收：devbox 容器唯一化（2026-10-28，Windows 真机）
+
+变更加归档在 OpenSpec `2026-10-28-unify-devbox-container-and-vpn-services`：容器只经 compose 创建、名字固定 `cadence_devbox`、relay 探测按运行态、地址问句给出取值指引、已录域名做解析核对。
+
+真机环境：Windows + Podman Desktop 6.0.2（WSL 后端）+ ACR `latest` 镜像。
+
+**已验证（真机）**
+
+- [x] `podman-compose 6.0.2` **支持** `container_name`：`podman ps` 显示容器名 `cadence_devbox`，安装器不再输出「未按固定名创建容器」警告
+- [x] `install.ps1 -InstallDir <既有安装目录>` 生效：`生成安装目录` 指向正确路径，`.env` 被重新生成（三行齐全）
+- [x] `stack\CHANGES.md` 存在时 entrypoint 跳过模板同步（日志：`检测到 CHANGES.md：保留当前 /cadence/stack`），本地 `container_name` 不被镜像内置模板覆盖
+- [x] 17 个命名卷全部保留；agent 登录态（`.claude` / `.codex` / `.omp`）与 `cadence-jdks` 卷未丢
+- [x] relay 通道恢复后，容器内 `git fetch origin --prune` 至 GitLab（`198.18.0.2:80` 经 VM 侧 DNAT）成功
+
+**本次暴露并已修的问题**
+
+| 问题 | 处置 |
+|---|---|
+| 老 `.env` 缺 `CADENCE_DEVBOX_IMAGE` → compose 回落最早版镜像 → `mkdir /home/dev/.cadence/logs: Permission denied`，容器 Exit 1 | install.ps1 新增 `Resolve-EnvImage`：缺键自动补写（并加测试） |
+| `install.ps1` 无 `-InstallDir`，已有安装目录在别处时静默装出第二套 | 新增 `-InstallDir` 参数（与 relay.ps1 对齐） |
+| `cadence-jdks` 卷属主 `root:root` → `jdk` 报「状态目录不可写」 | `chown -R dev:dev` 一次性修复（FAQ 13） |
+| 改了 `stack\compose.yaml` 会被镜像内置模板覆盖 | 需在 `stack\` 建 `CHANGES.md`（FAQ 12）；下个镜像构建会把新模板打进去，届时可不再需要 |
+
+**未纳入本次**：镜像内 skills 安装脚本报 `set: pipefail: invalid option name`（既有问题，软失败不阻断容器启动）。
 
 ## 9. 镜像构建信息
 

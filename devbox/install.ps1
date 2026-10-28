@@ -3,6 +3,8 @@
 #           → 4.建 17 数据卷+拉镜像(默认阿里云 ACR 直拉)+起中间件与 devbox → 5.打印后续提示
 # 用法（在仓库根目录——devbox 文件夹的上一层——打开 PowerShell；任意目录则 -File 用绝对路径）：
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
+#   已有安装目录在别处（不在 <仓库>/cadence）时必须显式指定，否则会装出第二套：
+#   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -InstallDir D:\testpodman\cadence -Workspace D:\code
 param(
   [string]$Image = "crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest",
   [string]$Workspace = "",
@@ -76,11 +78,25 @@ if (Test-Path "$InstallDir\cadence-box.yaml") {
   Copy-Item "$PSScriptRoot\cadence-box.yaml.example" "$InstallDir\cadence-box.yaml"
   Warn "已生成 cadence-box.yaml 模板——该文件=密钥，勿提交勿分享"
 }
+# 读 .env 里的镜像键；缺键时补写一行并返回默认镜像。
+# 为什么必须补：compose 写的是 ${CADENCE_DEVBOX_IMAGE:-cadence-devbox:1.0.0}——缺键会回落到
+# 最早那版镜像，而老镜像没有预建挂载点（dev 写不进 /home/dev/.cadence），容器启动即退出。
+# 2026-10-28 Windows 实测：老安装目录 .env 缺该键 → compose 回落老镜像 → entrypoint Exit 1。
+function Resolve-EnvImage([string]$envPath, [string]$defaultImage) {
+  $m = Select-String -Path $envPath -Pattern '^CADENCE_DEVBOX_IMAGE=(.+)$'
+  if ($m) {
+    $v = $m.Matches[0].Groups[1].Value.Trim()
+    if ($v) { return $v }   # 容器跟随 .env 里的镜像，保证与配置一致
+  }
+  Add-Content -Encoding ascii -Path $envPath -Value "CADENCE_DEVBOX_IMAGE=$defaultImage"
+  Info "stack\.env 缺 CADENCE_DEVBOX_IMAGE——已补为 $defaultImage（否则 compose 会回落到默认老镜像）"
+  return $defaultImage
+}
+
 # .env：工作区/镜像/启用 profile（默认空=仅 mysql+redis）——已存在则保留，防抹掉用户启用的 profile
 if (Test-Path "$InstallDir\stack\.env") {
   Warn "stack\.env 已存在，保留不覆盖（改工作区/镜像请手动编辑它）"
-  $envImage = (Select-String -Path "$InstallDir\stack\.env" -Pattern '^CADENCE_DEVBOX_IMAGE=(.+)$').Matches[0].Groups[1].Value.Trim()
-  if ($envImage) { $Image = $envImage }   # 容器跟随 .env 里的镜像，保证与配置一致
+  $Image = Resolve-EnvImage "$InstallDir\stack\.env" $Image
 } else {
   $ws = ($Workspace -replace '\\', '/').TrimEnd('/')
   "CADENCE_WORKSPACE=$ws`nCADENCE_DEVBOX_IMAGE=$Image`nCOMPOSE_PROFILES=" | Set-Content "$InstallDir\stack\.env" -Encoding ascii
