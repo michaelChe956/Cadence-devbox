@@ -1009,10 +1009,21 @@ tar czf /tmp/devbox-files.tar.gz devbox/
 
 工作流会构建、验证两个关键路径（`/home/dev/.cadence` 存在、`/opt/cadence/stack/compose.yaml` 存在）、推送，并在 Summary 里给出升级命令。
 
-**B. 本地构建并推送**（需要 ACR 写权限）
+**B. 本地构建并推送**（需要 ACR 写权限；构建在 podman machine 的 Linux VM 内执行，不是 Windows 原生）
+
+仓库自带一键脚本 `devbox/publish-image.ps1`——构建 + 三项校验（`.cadence` 预建 / 模板含 `container_name` / entrypoint 语法）+ 可选推送：
+
+```powershell
+# 只构建并校验（不推）
+powershell -ExecutionPolicy Bypass -File .\devbox\publish-image.ps1 -Tag 2026.44
+
+# 构建 + 校验 + 推送，并把 latest 一起更新
+powershell -ExecutionPolicy Bypass -File .\devbox\publish-image.ps1 -Tag 2026.44 -Push -AlsoLatest
+```
+
+手工等价命令（脚本内部就是这么做的，注意先去掉首行 `# syntax=`）：
 
 ```bash
-# 在 Linux（或 WSL）侧执行；构建上下文是 devbox/
 podman build -f devbox/Dockerfile -t <registry>/cadence/devbox:2026.44 devbox
 podman push <registry>/cadence/devbox:2026.44
 ```

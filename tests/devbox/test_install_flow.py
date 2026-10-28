@@ -94,6 +94,19 @@ def test_install_backfills_missing_image_key():
         "缺键时须把镜像写回 .env"
 
 
+def test_publish_script_exists_and_documented():
+    """发布脚本存在、能去 syntax 指令、推前有三项校验；README 引用了它。"""
+    script = REPO / "devbox" / "publish-image.ps1"
+    assert script.is_file(), "缺 devbox/publish-image.ps1"
+    text = script.read_text(encoding="utf-8")
+    assert "syntax=" in text and "-replace" in text, "须去掉 Dockerfile 首行 syntax 指令"
+    for check in ("/home/dev/.cadence", "container_name", "bash -n /usr/local/bin/cadence-entrypoint"):
+        assert check in text, f"推前校验缺项：{check}"
+    assert "podman push" in text
+    readme = README.read_text(encoding="utf-8")
+    assert "publish-image.ps1" in readme, "README 须引用发布脚本"
+
+
 def test_readme_uses_fixed_container_name_only():
     """手册里的容器命令一律指向固定名——旧名残留会把用户带回老路。"""
     text = README.read_text(encoding="utf-8")
