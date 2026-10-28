@@ -899,6 +899,20 @@ podman rm -f cadence_devbox && # 按启动命令重建（建议存成 start-devb
     "cadence-claude","cadence-codex","cadence-pi","cadence-agents","cadence-omp","cadence-npm","cadence-uv","cadence-pip" | ForEach-Object { podman run --rm -v "${_}:/d" docker.io/library/alpine:latest chown -R 1000:1000 /d }
     ```
     执行前先 `podman compose stop devbox`；修完 `podman compose up -d` 即可
+12. **改了 `stack\compose.yaml`（如固定容器名），重启容器后改动消失**：entrypoint 每次启动会用镜像内置模板同步 `stack/`——**分叉的文件会被备份后覆盖**。要长期保留本地版，在 `stack\` 下建 `CHANGES.md`（内容写清改了什么），entrypoint 检测到它即整段跳过同步：
+    ```powershell
+    @'
+    # 本地改动记录
+    - compose.yaml：devbox 服务固定容器名 cadence_devbox
+    '@ | Set-Content -Encoding utf8 D:\testpodman\cadence\stack\CHANGES.md
+    ```
+13. **`jdk list` 报「状态目录不可写」/ `jdk use 8` 失败**：老环境里 `cadence-jdks` 卷的属主可能是 `root:root`（早期镜像初始化所致），容器内 dev 写不进。一次性修复（执行前先停容器，修完再起）：
+    ```powershell
+    podman stop cadence_devbox
+    podman run --rm -v cadence-jdks:/d docker.io/library/alpine:latest chown -R 1000:1000 /d
+    podman start cadence_devbox
+    ```
+    也可以用运行中的容器直接修：`podman exec -u root cadence_devbox chown -R dev:dev /home/dev/.cadence` 然后 `podman stop cadence_devbox; podman start cadence_devbox`
 
 ## 8. Windows 真机验收（已执行：2026-09-21，维护者 michaelChe）
 
