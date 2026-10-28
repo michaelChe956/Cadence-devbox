@@ -1028,6 +1028,8 @@ podman build -f devbox/Dockerfile -t <registry>/cadence/devbox:2026.44 devbox
 podman push <registry>/cadence/devbox:2026.44
 ```
 
+> ⚠️ **zsh 用户注意**：`podman push "$IMAGE:latest"` 在 zsh 里会被解析成 `$IMAGE:l`（转小写修饰符）+ 字面量 `atest`，实际推到 `.../devboxatest`——会在 ACR 里凭空多建一个仓库。必须写成 `${IMAGE}:latest`。`$IMAGE:2026.44` 侥幸没事（`2` 不是合法修饰符），所以这坑只在 `:latest` 这类字母开头的 tag 上出现。bash 无此问题。
+
 **为什么必须重新构建镜像才能撤掉 `CHANGES.md`**：镜像里内置了构建时的 `stack/` 模板
 （`compose.yaml` / `docker-compose.no-sock.yml` / `catalog`），entrypoint 每次启动会把它们同步
 到安装目录。改了模板文件（例如给 `compose.yaml` 加 `container_name`）后，只有新镜像才带新模板；
