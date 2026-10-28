@@ -5,7 +5,8 @@
 #   powershell -ExecutionPolicy Bypass -File .\devbox\install.ps1 -Workspace D:\code
 param(
   [string]$Image = "crpi-qzp491l6hpbyhd49.cn-hangzhou.personal.cr.aliyuncs.com/cadence/devbox:latest",
-  [string]$Workspace = ""
+  [string]$Workspace = "",
+  [string]$InstallDir = ""
 )
 $ErrorActionPreference = 'Stop'
 if (-not $InstallDir) { $InstallDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'cadence' }

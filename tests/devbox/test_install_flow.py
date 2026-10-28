@@ -76,6 +76,16 @@ def test_install_tips_use_actual_container_name():
         "收尾提示不得再按旧容器名给命令"
 
 
+def test_install_accepts_install_dir_parameter():
+    """install.ps1 必须支持 -InstallDir（与 relay.ps1 一致）。
+
+    否则它永远装到 <仓库>/cadence——已有安装目录在别处时，重跑会静默造出第二套安装。
+    """
+    text = INSTALL_PS1.read_text(encoding="utf-8")
+    assert re.search(r"\[string\]\$InstallDir", text), \
+        "install.ps1 缺 -InstallDir 参数（与 relay.ps1 不一致，无法指向已有安装目录）"
+
+
 def test_readme_uses_fixed_container_name_only():
     """手册里的容器命令一律指向固定名——旧名残留会把用户带回老路。"""
     text = README.read_text(encoding="utf-8")
